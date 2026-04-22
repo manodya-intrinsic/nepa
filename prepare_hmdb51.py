@@ -5,7 +5,7 @@ import shutil
 import subprocess
 import urllib.request
 
-from datasets import ClassLabel, Dataset, DatasetDict, Video
+from datasets import ClassLabel, Dataset, DatasetDict, Video, load_dataset
 
 
 HMDB51_VIDEOS_URL = "https://serre-lab.clps.brown.edu/wp-content/uploads/2013/10/hmdb51_org.rar"
@@ -28,6 +28,30 @@ def download_file(url: str, target_path: str, force: bool = False) -> None:
     ensure_dir(os.path.dirname(target_path))
     print(f"[DOWNLOAD] {url} -> {target_path}")
     urllib.request.urlretrieve(url, target_path)
+
+
+def is_rar_archive(path: str) -> bool:
+    if not os.path.exists(path) or os.path.getsize(path) < 8:
+        return False
+    with open(path, "rb") as f:
+        header = f.read(8)
+    # RAR4: 52 61 72 21 1A 07 00
+    # RAR5: 52 61 72 21 1A 07 01 00
+    return header.startswith(b"Rar!\x1a\x07")
+
+
+def validate_rar_or_raise(path: str, name: str) -> None:
+    if is_rar_archive(path):
+        return
+    preview = b""
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            preview = f.read(128)
+    raise RuntimeError(
+        f"{name} at {path} is not a valid RAR archive. "
+        f"This usually means the URL returned an HTML/error page instead of the binary archive. "
+        f"File head bytes: {preview!r}"
+    )
 
 
 def require_unrar() -> None:
@@ -124,6 +148,43 @@ def build_dataset_dict(videos_root: str, splits_root: str, fold: int, val_ratio:
     )
 
 
+def prepare_from_hf_dataset(dataset_id: str, output_dir: str, val_ratio: float, seed: int) -> None:
+    """Load a ready-made HMDB51 dataset from the Hugging Face Hub and save a split DatasetDict.
+
+    This path matches the Colab workflow where you previously used `snapshot_download` or direct `load_dataset`.
+    It is useful when the dataset repository already contains the videos and metadata, so no manual RAR handling is
+    required.
+    """
+
+    print(f"[HF LOAD] Loading dataset from: {dataset_id}")
+    dataset = load_dataset(dataset_id)
+
+    if "train" not in dataset:
+        raise ValueError(f"Dataset {dataset_id} does not contain a train split.")
+
+    if "label" not in dataset["train"].column_names:
+        raise ValueError(
+            f"Dataset {dataset_id} must contain a 'label' column to create a class-wise validation split."
+        )
+
+    if not isinstance(dataset["train"].features["label"], ClassLabel):
+        raise ValueError(
+            f"Dataset {dataset_id} label column must be ClassLabel for stratified splitting."
+        )
+
+    split = dataset["train"].train_test_split(test_size=val_ratio, seed=seed, stratify_by_column="label")
+
+    prepared = DatasetDict({"train": split["train"], "validation": split["test"]})
+    if "test" in dataset:
+        prepared["test"] = dataset["test"]
+
+    ensure_dir(os.path.dirname(output_dir) or ".")
+    print(f"[SAVE] Writing HF dataset to: {output_dir}")
+    prepared.save_to_disk(output_dir)
+    print(prepared)
+    print("[DONE] HMDB51 HF dataset prepared successfully")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Prepare HMDB51 as a Hugging Face DatasetDict.")
     parser.add_argument("--work_dir", default="data/hmdb51_work", help="Temporary working directory.")
@@ -136,7 +197,36 @@ def main() -> None:
     parser.add_argument("--val_ratio", type=float, default=0.1, help="Validation ratio from train split.")
     parser.add_argument("--seed", type=int, default=1337, help="Random seed for split.")
     parser.add_argument("--force_download", action="store_true", help="Re-download archive files.")
+    parser.add_argument(
+        "--videos_rar_path",
+        default=None,
+        help="Optional local path to hmdb51_org.rar. If set, download is skipped for videos archive.",
+    )
+    parser.add_argument(
+        "--splits_rar_path",
+        default=None,
+        help="Optional local path to test_train_splits.rar. If set, download is skipped for split archive.",
+    )
+    parser.add_argument(
+        "--skip_download",
+        action="store_true",
+        help="Skip URL downloads and only use local archive paths.",
+    )
+    parser.add_argument(
+        "--hf_dataset_id",
+        default=None,
+        help="Optional Hugging Face dataset repo id (for example: jili5044/hmdb51). If set, this path bypasses RAR downloads and uses the HF dataset directly.",
+    )
     args = parser.parse_args()
+
+    if args.hf_dataset_id is not None:
+        prepare_from_hf_dataset(
+            dataset_id=args.hf_dataset_id,
+            output_dir=args.output_dir,
+            val_ratio=args.val_ratio,
+            seed=args.seed,
+        )
+        return
 
     require_unrar()
 
@@ -153,8 +243,27 @@ def main() -> None:
     videos_rar = os.path.join(raw_dir, "hmdb51_org.rar")
     splits_rar = os.path.join(raw_dir, "test_train_splits.rar")
 
-    download_file(HMDB51_VIDEOS_URL, videos_rar, force=args.force_download)
-    download_file(HMDB51_SPLITS_URL, splits_rar, force=args.force_download)
+    if args.videos_rar_path is not None:
+        videos_rar = args.videos_rar_path
+    elif not args.skip_download:
+        download_file(HMDB51_VIDEOS_URL, videos_rar, force=args.force_download)
+
+    if args.splits_rar_path is not None:
+        splits_rar = args.splits_rar_path
+    elif not args.skip_download:
+        download_file(HMDB51_SPLITS_URL, splits_rar, force=args.force_download)
+
+    if not os.path.exists(videos_rar):
+        raise FileNotFoundError(
+            f"Videos archive not found: {videos_rar}. Provide --videos_rar_path or allow download."
+        )
+    if not os.path.exists(splits_rar):
+        raise FileNotFoundError(
+            f"Splits archive not found: {splits_rar}. Provide --splits_rar_path or allow download."
+        )
+
+    validate_rar_or_raise(videos_rar, "videos archive")
+    validate_rar_or_raise(splits_rar, "split archive")
 
     # Extract top-level archives.
     extract_rar(videos_rar, extract_dir)
