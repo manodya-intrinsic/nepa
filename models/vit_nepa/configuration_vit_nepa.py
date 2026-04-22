@@ -84,6 +84,10 @@ class ViTNepaConfig(PretrainedConfig):
             Amount of jitter applied to positional embedding coordinates as a training augmentation.
         pos_embed_rescale (`float`, *optional*, defaults to 2.0):
             Rescaling factor applied to positional embedding coordinates (e.g. when interpolating to new resolutions).
+        num_frames (`int`, *optional*, defaults to 16):
+            Number of frames in each input video clip.
+        tubelet_size (`int`, *optional*, defaults to 2):
+            Temporal tubelet size used by 3D patch embedding.
         kwargs:
             Additional keyword arguments passed to [`PretrainedConfig`].
 
@@ -131,6 +135,8 @@ class ViTNepaConfig(PretrainedConfig):
         pos_embed_shift: Optional[float] = None,
         pos_embed_jitter: Optional[float] = None,
         pos_embed_rescale: Optional[float] = 2.0,
+        num_frames=16,
+        tubelet_size=2,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -160,6 +166,8 @@ class ViTNepaConfig(PretrainedConfig):
         self.pos_embed_shift = pos_embed_shift
         self.pos_embed_jitter = pos_embed_jitter
         self.pos_embed_rescale = pos_embed_rescale
+        self.num_frames = num_frames
+        self.tubelet_size = tubelet_size
 
 
 __all__ = ["ViTNepaConfig"]
