@@ -104,29 +104,72 @@ class ViTNepaVideoEmbeddings(nn.Module):
 
 
 class ViTNepaVideoRopePositionEmbedding(nn.Module):
-	"""RoPE for video patch tokens using linearized time-major token indices."""
+	"""Axis-aware 3D RoPE for video patch tokens over (time, height, width)."""
 
 	def __init__(self, config: ViTNepaConfig):
 		super().__init__()
 		self.base = config.rope_theta
 		self.head_dim = config.hidden_size // config.num_attention_heads
-		inv_freq = 1.0 / (self.base ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
-		self.register_buffer("inv_freq", inv_freq, persistent=False)
 		self.patch_size = (
 			config.patch_size if isinstance(config.patch_size, tuple) else (config.patch_size, config.patch_size)
 		)
 		self.tubelet_size = config.tubelet_size
 
-	def forward(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-		_, _, t, h, w = pixel_values.shape
-		num_patches = (t // self.tubelet_size) * (h // self.patch_size[0]) * (w // self.patch_size[1])
+		# Split RoPE channels across temporal, vertical, and horizontal axes.
+		base_chunk = self.head_dim // 3
+		self.axis_dims = [base_chunk, base_chunk, self.head_dim - (2 * base_chunk)]
 
-		positions = torch.arange(num_patches, device=pixel_values.device, dtype=torch.float32)
-		inv_freq = cast(torch.Tensor, self.inv_freq)
-		angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)
+		for idx, axis_dim in enumerate(self.axis_dims):
+			even_dim = axis_dim if axis_dim % 2 == 0 else axis_dim - 1
+			if even_dim <= 0:
+				inv_freq = torch.empty(0, dtype=torch.float32)
+			else:
+				inv_freq = 1.0 / (
+					self.base ** (torch.arange(0, even_dim, 2, dtype=torch.float32) / max(even_dim, 1))
+				)
+			self.register_buffer(f"inv_freq_axis_{idx}", inv_freq, persistent=False)
+
+	def _axis_angles(self, coords: torch.Tensor, axis_dim: int, inv_freq: torch.Tensor) -> torch.Tensor:
+		if axis_dim <= 0:
+			return torch.empty(coords.shape[0], 0, device=coords.device, dtype=torch.float32)
+
+		even_dim = axis_dim if axis_dim % 2 == 0 else axis_dim - 1
+		if even_dim <= 0:
+			return torch.zeros(coords.shape[0], axis_dim, device=coords.device, dtype=torch.float32)
+
+		angles = coords.unsqueeze(1) * inv_freq.unsqueeze(0)
 		angles = torch.cat((angles, angles), dim=-1)
 
+		if even_dim != axis_dim:
+			pad = torch.zeros(coords.shape[0], 1, device=coords.device, dtype=angles.dtype)
+			angles = torch.cat((angles, pad), dim=-1)
+
+		return angles
+
+	def forward(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+		_, _, t, h, w = pixel_values.shape
+		t_tokens = t // self.tubelet_size
+		h_tokens = h // self.patch_size[0]
+		w_tokens = w // self.patch_size[1]
+
+		device = pixel_values.device
 		dtype = pixel_values.dtype
+
+		# Use normalized patch-center coordinates in [-1, 1] for each axis.
+		t_coords = (2.0 * ((torch.arange(t_tokens, device=device, dtype=torch.float32) + 0.5) / t_tokens)) - 1.0
+		h_coords = (2.0 * ((torch.arange(h_tokens, device=device, dtype=torch.float32) + 0.5) / h_tokens)) - 1.0
+		w_coords = (2.0 * ((torch.arange(w_tokens, device=device, dtype=torch.float32) + 0.5) / w_tokens)) - 1.0
+
+		t_grid, h_grid, w_grid = torch.meshgrid(t_coords, h_coords, w_coords, indexing="ij")
+		flat_t = t_grid.reshape(-1)
+		flat_h = h_grid.reshape(-1)
+		flat_w = w_grid.reshape(-1)
+
+		angles_t = self._axis_angles(flat_t, self.axis_dims[0], cast(torch.Tensor, self.inv_freq_axis_0))
+		angles_h = self._axis_angles(flat_h, self.axis_dims[1], cast(torch.Tensor, self.inv_freq_axis_1))
+		angles_w = self._axis_angles(flat_w, self.axis_dims[2], cast(torch.Tensor, self.inv_freq_axis_2))
+		angles = torch.cat((angles_t, angles_h, angles_w), dim=-1)
+
 		cos = torch.cos(angles).to(dtype=dtype)
 		sin = torch.sin(angles).to(dtype=dtype)
 		return cos, sin
