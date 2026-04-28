@@ -94,7 +94,21 @@ def _resolve_video_path(video_entry) -> str:
         if video_entry.get("path") is not None:
             return video_entry["path"]
         raise ValueError(f"Video entry does not contain a path: {video_entry}")
+    if hasattr(video_entry, "path") and video_entry.path is not None:
+        return video_entry.path
     return str(video_entry)
+
+
+def _get_video_entries(example_batch, column_name: str):
+    if column_name in example_batch:
+        return example_batch[column_name]
+    for fallback_name in ("video", "path", "file", "video_file"):
+        if fallback_name in example_batch:
+            logger.warning(
+                f"--video_column_name {column_name!r} was not present in the batch; using {fallback_name!r} instead."
+            )
+            return example_batch[fallback_name]
+    raise KeyError(f"Could not find a video column in batch keys: {list(example_batch.keys())}")
 
 
 def _sample_frame_indices(total_frames: int, num_frames: int, train: bool) -> torch.Tensor:
@@ -280,17 +294,19 @@ def main():
         model = ViTNepaVideoForPreTraining(config)
 
     def train_transforms(example_batch):
+        video_entries = _get_video_entries(example_batch, data_args.video_column_name)
         pixel_values = [
             _video_to_clip_tensor(_resolve_video_path(video_item), data_args.num_frames, data_args.resize_size, True)
-            for video_item in example_batch[data_args.video_column_name]
+            for video_item in video_entries
         ]
         example_batch["pixel_values"] = pixel_values
         return example_batch
 
     def val_transforms(example_batch):
+        video_entries = _get_video_entries(example_batch, data_args.video_column_name)
         pixel_values = [
             _video_to_clip_tensor(_resolve_video_path(video_item), data_args.num_frames, data_args.resize_size, False)
-            for video_item in example_batch[data_args.video_column_name]
+            for video_item in video_entries
         ]
         example_batch["pixel_values"] = pixel_values
         return example_batch
