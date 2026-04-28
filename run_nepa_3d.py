@@ -114,9 +114,19 @@ def _sample_frame_indices(total_frames: int, num_frames: int, train: bool) -> to
 
 
 def _video_to_clip_tensor(video_path: str, num_frames: int, spatial_size: int, train: bool) -> torch.Tensor:
-    video, _, _ = read_video(video_path, pts_unit="sec")
+    try:
+        video, _, _ = read_video(video_path, pts_unit="sec")
+    except Exception as e:
+        logger.warning(f"Failed to read video {video_path}: {e}. Returning None.")
+        return None
+    
     if video.ndim != 4:
-        raise ValueError(f"Expected video tensor with 4 dims [T,H,W,C], got shape {tuple(video.shape)}")
+        logger.warning(f"Expected video tensor with 4 dims [T,H,W,C], got shape {tuple(video.shape)} for {video_path}. Returning None.")
+        return None
+
+    if video.shape[0] == 0:
+        logger.warning(f"Video {video_path} has 0 frames. Skipping.")
+        return None
 
     # torchvision returns [T, H, W, C]. Convert to [T, C, H, W].
     if video.shape[-1] == 3:
@@ -228,7 +238,13 @@ def main():
     dataset = dataset.cast_column(data_args.video_column_name, Video(decode=False))
 
     def collate_fn(examples):
-        pixel_values = torch.stack([example["pixel_values"] for example in examples])
+        # Filter out examples with None pixel_values (corrupted videos)
+        valid_examples = [ex for ex in examples if ex["pixel_values"] is not None]
+        if not valid_examples:
+            # If all examples are corrupted, raise an error or return empty batch
+            logger.warning("All examples in batch are corrupted. Returning empty batch.")
+            return {"pixel_values": torch.empty((0, 3, 16, 224, 224))}  # Dummy shape
+        pixel_values = torch.stack([example["pixel_values"] for example in valid_examples])
         return {"pixel_values": pixel_values}
 
     data_args.train_val_split = None if "validation" in dataset else data_args.train_val_split
@@ -264,17 +280,19 @@ def main():
         model = ViTNepaVideoForPreTraining(config)
 
     def train_transforms(example_batch):
-        example_batch["pixel_values"] = [
+        pixel_values = [
             _video_to_clip_tensor(_resolve_video_path(video_item), data_args.num_frames, data_args.resize_size, True)
             for video_item in example_batch[data_args.video_column_name]
         ]
+        example_batch["pixel_values"] = pixel_values
         return example_batch
 
     def val_transforms(example_batch):
-        example_batch["pixel_values"] = [
+        pixel_values = [
             _video_to_clip_tensor(_resolve_video_path(video_item), data_args.num_frames, data_args.resize_size, False)
             for video_item in example_batch[data_args.video_column_name]
         ]
+        example_batch["pixel_values"] = pixel_values
         return example_batch
 
     if training_args.do_train:
