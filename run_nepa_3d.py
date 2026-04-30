@@ -215,6 +215,9 @@ def main():
     )
     logger.info(f"Training/evaluation parameters {training_args}")
 
+    # Prevent Trainer from removing video/label columns before dataset transforms can access them
+    training_args.remove_unused_columns = False
+
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
