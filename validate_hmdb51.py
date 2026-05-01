@@ -80,7 +80,7 @@ def main():
     )
     parser.add_argument(
         "--max_samples",
-        type=int,
+        type=lambda x: None if x.lower() == "none" else int(x),
         default=None,
         help="Max samples to check (None = all).",
     )
