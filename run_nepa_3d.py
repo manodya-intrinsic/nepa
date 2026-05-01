@@ -255,12 +255,17 @@ def main():
     dataset = dataset.cast_column(data_args.video_column_name, Video(decode=False))
 
     def collate_fn(examples):
-        # Filter out examples with None pixel_values (corrupted videos)
+        # Filter out examples with None pixel_values (corrupted videos).
         valid_examples = [ex for ex in examples if ex["pixel_values"] is not None]
         if not valid_examples:
-            # If all examples are corrupted, raise an error or return empty batch
-            logger.warning("All examples in batch are corrupted. Returning empty batch.")
-            return {"pixel_values": torch.empty((0, 3, 16, 224, 224))}  # Dummy shape
+            # Keep training moving by emitting a single zero clip instead of a size-0 batch.
+            logger.warning("All examples in batch are corrupted. Returning a zero clip fallback.")
+            return {
+                "pixel_values": torch.zeros(
+                    (1, 3, data_args.num_frames, data_args.resize_size, data_args.resize_size),
+                    dtype=torch.float32,
+                )
+            }
         pixel_values = torch.stack([example["pixel_values"] for example in valid_examples])
         return {"pixel_values": pixel_values}
 
