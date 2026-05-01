@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset, load_from_disk, Video
 from torchvision.io import read_video
 
 logging.basicConfig(
@@ -100,6 +100,9 @@ def main():
     dataset = dataset_dict[args.split]
     logger.info(f"Dataset has {len(dataset)} examples.")
     
+    # Cast video column to decode=False to get raw paths without auto-decoding
+    dataset = dataset.cast_column(args.video_column, Video(decode=False))
+    
     # Optionally limit samples
     if args.max_samples:
         dataset = dataset.select(range(min(args.max_samples, len(dataset))))
@@ -119,9 +122,11 @@ def main():
         
         video_entry = example[args.video_column]
         
-        # Resolve video path
-        if isinstance(video_entry, dict):
-            video_path = video_entry.get("path")
+        # Resolve video path from Video(decode=False) format or raw path
+        if isinstance(video_entry, dict) and "path" in video_entry:
+            video_path = video_entry["path"]
+        elif isinstance(video_entry, dict):
+            video_path = video_entry.get("path", str(video_entry))
         elif hasattr(video_entry, "path"):
             video_path = video_entry.path
         else:
