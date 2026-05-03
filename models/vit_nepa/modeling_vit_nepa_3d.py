@@ -209,6 +209,7 @@ class ViTNepaVideoModel(ViTNepaPreTrainedModel):
 			head_mask=head_mask,
 			output_attentions=output_attentions,
 			position_embeddings=position_embeds,
+			is_causal=self.config.is_causal,
 		)
 		sequence_output = self.layernorm(encoder_outputs.last_hidden_state)
 
