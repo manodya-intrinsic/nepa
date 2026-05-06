@@ -96,7 +96,7 @@ def parse_split_file(split_path: str) -> list[tuple[str, int]]:
     return rows
 
 
-def build_dataset_dict(videos_root: str, splits_root: str, fold: int, val_ratio: float, seed: int) -> DatasetDict:
+def build_dataset_dict(videos_root: str, splits_root: str, fold: int, val_ratio: float, seed: int, create_validation: bool = False) -> DatasetDict:
     split_files = sorted(glob.glob(os.path.join(splits_root, f"*_test_split{fold}.txt")))
     if not split_files:
         raise FileNotFoundError(f"No split files found for fold {fold} in: {splits_root}")
@@ -133,22 +133,31 @@ def build_dataset_dict(videos_root: str, splits_root: str, fold: int, val_ratio:
     test_ds = test_ds.cast_column("label", label_feature)
     test_ds = test_ds.cast_column("video", Video(decode=False))
 
-    train_val = train_ds.train_test_split(
-        test_size=val_ratio,
-        seed=seed,
-        stratify_by_column="label",
-    )
+    if create_validation:
+        train_val = train_ds.train_test_split(
+            test_size=val_ratio,
+            seed=seed,
+            stratify_by_column="label",
+        )
 
+        return DatasetDict(
+            {
+                "train": train_val["train"],
+                "validation": train_val["test"],
+                "test": test_ds,
+            }
+        )
+
+    # If validation creation is disabled, return only the official train and test splits
     return DatasetDict(
         {
-            "train": train_val["train"],
-            "validation": train_val["test"],
+            "train": train_ds,
             "test": test_ds,
         }
     )
 
 
-def prepare_from_hf_dataset(dataset_id: str, output_dir: str, val_ratio: float, seed: int) -> None:
+def prepare_from_hf_dataset(dataset_id: str, output_dir: str, val_ratio: float, seed: int, create_validation: bool = False) -> None:
     """Load a ready-made HMDB51 dataset from the Hugging Face Hub and save a split DatasetDict.
 
     This path matches the Colab workflow where you previously used `snapshot_download` or direct `load_dataset`.
@@ -172,9 +181,13 @@ def prepare_from_hf_dataset(dataset_id: str, output_dir: str, val_ratio: float, 
             f"Dataset {dataset_id} label column must be ClassLabel for stratified splitting."
         )
 
-    split = dataset["train"].train_test_split(test_size=val_ratio, seed=seed, stratify_by_column="label")
+    if create_validation:
+        split = dataset["train"].train_test_split(test_size=val_ratio, seed=seed, stratify_by_column="label")
 
-    prepared = DatasetDict({"train": split["train"], "validation": split["test"]})
+        prepared = DatasetDict({"train": split["train"], "validation": split["test"]})
+    else:
+        prepared = DatasetDict({"train": dataset["train"]})
+
     if "test" in dataset:
         prepared["test"] = dataset["test"]
 
@@ -217,6 +230,11 @@ def main() -> None:
         default=None,
         help="Optional Hugging Face dataset repo id (for example: jili5044/hmdb51). If set, this path bypasses RAR downloads and uses the HF dataset directly.",
     )
+    parser.add_argument(
+        "--create_validation",
+        action="store_true",
+        help="Create a validation split from the official train set (stratified).",
+    )
     args = parser.parse_args()
 
     if args.hf_dataset_id is not None:
@@ -225,6 +243,7 @@ def main() -> None:
             output_dir=args.output_dir,
             val_ratio=args.val_ratio,
             seed=args.seed,
+            create_validation=args.create_validation,
         )
         return
 
@@ -279,6 +298,7 @@ def main() -> None:
         fold=args.fold,
         val_ratio=args.val_ratio,
         seed=args.seed,
+        create_validation=args.create_validation,
     )
 
     ensure_dir(os.path.dirname(args.output_dir) or ".")
