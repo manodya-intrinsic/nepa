@@ -209,7 +209,6 @@ class ViTNepaVideoModel(ViTNepaPreTrainedModel):
 			head_mask=head_mask,
 			output_attentions=output_attentions,
 			position_embeddings=position_embeds,
-			is_causal=self.config.is_causal,
 		)
 		sequence_output = self.layernorm(encoder_outputs.last_hidden_state)
 
@@ -224,7 +223,7 @@ class ViTNepaVideoModel(ViTNepaPreTrainedModel):
 class ViTNepaVideoForPreTraining(ViTNepaPreTrainedModel):
 	def __init__(self, config: ViTNepaConfig):
 		super().__init__(config)
-		self.vit_nepa = ViTNepaVideoModel(config)
+		self.vit_nepa = ViTNepaVideoModel(config, use_mask_token=True)
 		self.post_init()
 
 	@can_return_tuple

@@ -260,14 +260,23 @@ def main():
         if not valid_examples:
             # Keep training moving by emitting a single zero clip instead of a size-0 batch.
             logger.warning("All examples in batch are corrupted. Returning a zero clip fallback.")
-            return {
-                "pixel_values": torch.zeros(
-                    (1, 3, data_args.num_frames, data_args.resize_size, data_args.resize_size),
-                    dtype=torch.float32,
-                )
-            }
-        pixel_values = torch.stack([example["pixel_values"] for example in valid_examples])
-        return {"pixel_values": pixel_values}
+            pixel_values = torch.zeros(
+                (1, 3, data_args.num_frames, data_args.resize_size, data_args.resize_size),
+                dtype=torch.float32,
+            )
+        else:
+            pixel_values = torch.stack([example["pixel_values"] for example in valid_examples])
+
+        batch_size = pixel_values.shape[0]
+        num_tokens = 1568
+        num_masked = 1411
+        bool_masked_pos = torch.zeros((batch_size, num_tokens), dtype=torch.bool)
+
+        for i in range(batch_size):
+            masked_indices = torch.randperm(num_tokens)[:num_masked]
+            bool_masked_pos[i, masked_indices] = True
+
+        return {"pixel_values": pixel_values, "bool_masked_pos": bool_masked_pos}
 
     data_args.train_val_split = None if "validation" in dataset else data_args.train_val_split
     if isinstance(data_args.train_val_split, float) and data_args.train_val_split > 0.0:
@@ -297,6 +306,16 @@ def main():
             trust_remote_code=model_args.trust_remote_code,
             ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
         )
+
+        # Ensure mask token stays enabled even when loading older checkpoints.
+        backbone_state = model.vit_nepa.state_dict()
+        model.vit_nepa = model.vit_nepa.__class__(config, use_mask_token=True)
+        model.post_init()
+        missing_keys, unexpected_keys = model.vit_nepa.load_state_dict(backbone_state, strict=False)
+        if missing_keys or unexpected_keys:
+            logger.warning(
+                f"Mask-token backbone reload had missing keys={missing_keys}, unexpected keys={unexpected_keys}"
+            )
     else:
         logger.info("Training new 3D NEPA model from scratch")
         model = ViTNepaVideoForPreTraining(config)
