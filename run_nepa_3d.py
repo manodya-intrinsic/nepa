@@ -231,7 +231,7 @@ def main():
     data_files = {"train": os.path.join(data_args.train_dir, "**")}
     if data_args.validation_dir is not None:
         data_files["validation"] = os.path.join(data_args.validation_dir, "**")
-    dataset = load_dataset("videofolder", data_files=data_files, cache_dir=model_args.cache_dir,decode =False)
+    dataset = load_dataset("videofolder", data_files=data_files, cache_dir=model_args.cache_dir)
 
     if data_args.video_column_name not in (dataset["train"].column_names if "train" in dataset else dataset["validation"].column_names):
         raise ValueError(f"--video_column_name {data_args.video_column_name} not found in the dataset columns.")
