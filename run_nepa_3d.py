@@ -27,6 +27,11 @@ import torch
 from datasets import ClassLabel, Video, load_dataset, load_from_disk
 from PIL import Image
 from torchvision.io import read_video
+try:
+    from decord import VideoReader, cpu as decord_cpu
+except Exception:
+    VideoReader = None
+    decord_cpu = None
 from torchvision.transforms import CenterCrop, Compose, Lambda, Normalize, RandomHorizontalFlip, RandomResizedCrop, Resize, ToTensor
 
 import transformers
@@ -128,26 +133,49 @@ def _sample_frame_indices(total_frames: int, num_frames: int, train: bool) -> to
 
 
 def _video_to_clip_tensor(video_path: str, num_frames: int, spatial_size: int, train: bool) -> torch.Tensor:
-    try:
-        video, _, _ = read_video(video_path, pts_unit="sec")
-    except Exception as e:
-        logger.warning(f"Failed to read video {video_path}: {e}. Returning None.")
-        return None
-    
-    if video.ndim != 4:
-        logger.warning(f"Expected video tensor with 4 dims [T,H,W,C], got shape {tuple(video.shape)} for {video_path}. Returning None.")
-        return None
+    # Try Decord first (faster/random access). Fall back to torchvision.read_video on error.
+    video = None
+    decoded_with_decord = False
+    if VideoReader is not None:
+        try:
+            vr = VideoReader(video_path, ctx=decord_cpu(0))
+            total_frames = len(vr)
+            if total_frames == 0:
+                logger.warning(f"Video {video_path} has 0 frames. Skipping.")
+                return None
+            frame_indices = _sample_frame_indices(total_frames, num_frames, train=train)
+            frames_np = vr.get_batch(frame_indices.cpu().numpy()).asnumpy()  # (T, H, W, C)
+            video = torch.from_numpy(frames_np).permute(0, 3, 1, 2)  # (T, C, H, W)
+            decoded_with_decord = True
+        except Exception as e:
+            logger.warning(f"Decord failed for {video_path}: {e}. Falling back to torchvision.read_video.")
 
-    if video.shape[0] == 0:
-        logger.warning(f"Video {video_path} has 0 frames. Skipping.")
+    if not decoded_with_decord:
+        try:
+            video, _, _ = read_video(video_path, pts_unit="sec")
+        except Exception as e:
+            logger.warning(f"Failed to read video {video_path}: {e}. Returning None.")
+            return None
+
+        if video.ndim != 4:
+            logger.warning(f"Expected video tensor with 4 dims [T,H,W,C], got shape {tuple(video.shape)} for {video_path}. Returning None.")
+            return None
+
+        if video.shape[0] == 0:
+            logger.warning(f"Video {video_path} has 0 frames. Skipping.")
+            return None
+
+        # torchvision returns [T, H, W, C]. Convert to [T, C, H, W].
+        if video.shape[-1] == 3:
+            video = video.permute(0, 3, 1, 2)
+
+        frame_indices = _sample_frame_indices(video.shape[0], num_frames, train=train)
+        video = video[frame_indices]
+
+    # At this point `video` is a torch tensor shaped (T, C, H, W)
+    if video.ndim != 4 or video.shape[0] == 0:
+        logger.warning(f"Decoded video not valid for {video_path}. Skipping.")
         return None
-
-    # torchvision returns [T, H, W, C]. Convert to [T, C, H, W].
-    if video.shape[-1] == 3:
-        video = video.permute(0, 3, 1, 2)
-
-    frame_indices = _sample_frame_indices(video.shape[0], num_frames, train=train)
-    video = video[frame_indices]
 
     if train:
         frame_transform = Compose(
@@ -268,8 +296,8 @@ def main():
             pixel_values = torch.stack([example["pixel_values"] for example in valid_examples])
 
         batch_size = pixel_values.shape[0]
-        num_tokens = 1568
-        num_masked = 1411
+        num_tokens = 2048
+        num_masked = 1843
         bool_masked_pos = torch.zeros((batch_size, num_tokens), dtype=torch.bool)
 
         for i in range(batch_size):
