@@ -260,7 +260,8 @@ def main():
     _configure_quiet_logging()
     transformers.utils.logging.set_verbosity_error()
     transformers.utils.logging.disable_default_handler()
-    transformers.utils.logging.disable_explicit_format()
+    if hasattr(transformers.utils.logging, "disable_explicit_format"):
+        transformers.utils.logging.disable_explicit_format()
 
     # Prevent Trainer from removing video/label columns before dataset transforms can access them
     training_args.remove_unused_columns = False
