@@ -24,9 +24,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
-from datasets import ClassLabel, Video, load_dataset, load_from_disk
+from datasets import ClassLabel, load_dataset
 from PIL import Image
-from torchvision.io import read_video
 try:
     from decord import VideoReader, cpu as decord_cpu
 except Exception:
@@ -48,14 +47,10 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class DataTrainingArguments:
-    dataset_name: Optional[str] = field(
-        default=None,
-        metadata={"help": "Name of a dataset from the hub, or a local dataset path to load."},
+    train_dir: Optional[str] = field(
+        default="/content/hmdb51_local",
+        metadata={"help": "A folder containing the training videos. Defaults to /content/hmdb51_local."},
     )
-    dataset_config_name: Optional[str] = field(
-        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
-    )
-    train_dir: Optional[str] = field(default=None, metadata={"help": "A folder containing the training videos."})
     validation_dir: Optional[str] = field(default=None, metadata={"help": "A folder containing validation videos."})
     train_val_split: Optional[float] = field(
         default=0.15, metadata={"help": "Percent to split off of train for validation."}
@@ -73,10 +68,8 @@ class DataTrainingArguments:
     keep_in_memory: bool = field(default=False, metadata={"help": "Keep dataset in memory."})
 
     def __post_init__(self):
-        if self.dataset_name is None and (self.train_dir is None and self.validation_dir is None):
-            raise ValueError(
-                "You must specify either a dataset name from the hub or a train and/or validation directory."
-            )
+        if self.train_dir is None:
+            raise ValueError("You must specify a training directory.")
 
 
 @dataclass
@@ -133,44 +126,22 @@ def _sample_frame_indices(total_frames: int, num_frames: int, train: bool) -> to
 
 
 def _video_to_clip_tensor(video_path: str, num_frames: int, spatial_size: int, train: bool) -> torch.Tensor:
-    # Try Decord first (faster/random access). Fall back to torchvision.read_video on error.
-    video = None
-    decoded_with_decord = False
-    if VideoReader is not None:
-        try:
-            vr = VideoReader(video_path, ctx=decord_cpu(0))
-            total_frames = len(vr)
-            if total_frames == 0:
-                logger.warning(f"Video {video_path} has 0 frames. Skipping.")
-                return None
-            frame_indices = _sample_frame_indices(total_frames, num_frames, train=train)
-            frames_np = vr.get_batch(frame_indices.cpu().numpy()).asnumpy()  # (T, H, W, C)
-            video = torch.from_numpy(frames_np).permute(0, 3, 1, 2)  # (T, C, H, W)
-            decoded_with_decord = True
-        except Exception as e:
-            logger.warning(f"Decord failed for {video_path}: {e}. Falling back to torchvision.read_video.")
+    if VideoReader is None or decord_cpu is None:
+        logger.warning("Decord is not available. Returning None for video decoding.")
+        return None
 
-    if not decoded_with_decord:
-        try:
-            video, _, _ = read_video(video_path, pts_unit="sec")
-        except Exception as e:
-            logger.warning(f"Failed to read video {video_path}: {e}. Returning None.")
-            return None
-
-        if video.ndim != 4:
-            logger.warning(f"Expected video tensor with 4 dims [T,H,W,C], got shape {tuple(video.shape)} for {video_path}. Returning None.")
-            return None
-
-        if video.shape[0] == 0:
+    try:
+        vr = VideoReader(video_path, ctx=decord_cpu(0))
+        total_frames = len(vr)
+        if total_frames == 0:
             logger.warning(f"Video {video_path} has 0 frames. Skipping.")
             return None
-
-        # torchvision returns [T, H, W, C]. Convert to [T, C, H, W].
-        if video.shape[-1] == 3:
-            video = video.permute(0, 3, 1, 2)
-
-        frame_indices = _sample_frame_indices(video.shape[0], num_frames, train=train)
-        video = video[frame_indices]
+        frame_indices = _sample_frame_indices(total_frames, num_frames, train=train)
+        frames_np = vr.get_batch(frame_indices.cpu().numpy()).asnumpy()  # (T, H, W, C)
+        video = torch.from_numpy(frames_np).permute(0, 3, 1, 2)  # (T, C, H, W)
+    except Exception as e:
+        logger.warning(f"Decord failed for {video_path}: {e}. Returning None.")
+        return None
 
     # At this point `video` is a torch tensor shaped (T, C, H, W)
     if video.ndim != 4 or video.shape[0] == 0:
@@ -257,30 +228,13 @@ def main():
 
     set_seed(training_args.seed)
 
-    if data_args.dataset_name is not None:
-        if data_args.load_from_disk:
-            dataset = load_from_disk(data_args.dataset_name, keep_in_memory=data_args.keep_in_memory)
-        else:
-            dataset = load_dataset(
-                data_args.dataset_name,
-                data_args.dataset_config_name,
-                cache_dir=model_args.cache_dir,
-                token=model_args.token,
-                trust_remote_code=model_args.trust_remote_code,
-            )
-    else:
-        data_files = {}
-        if data_args.train_dir is not None:
-            data_files["train"] = os.path.join(data_args.train_dir, "**")
-        if data_args.validation_dir is not None:
-            data_files["validation"] = os.path.join(data_args.validation_dir, "**")
-        dataset = load_dataset("videofolder", data_files=data_files, cache_dir=model_args.cache_dir)
+    data_files = {"train": os.path.join(data_args.train_dir, "**")}
+    if data_args.validation_dir is not None:
+        data_files["validation"] = os.path.join(data_args.validation_dir, "**")
+    dataset = load_dataset("videofolder", data_files=data_files, cache_dir=model_args.cache_dir)
 
     if data_args.video_column_name not in (dataset["train"].column_names if "train" in dataset else dataset["validation"].column_names):
         raise ValueError(f"--video_column_name {data_args.video_column_name} not found in the dataset columns.")
-
-    # Normalize video feature to a path/bytes struct for easy local decoding.
-    dataset = dataset.cast_column(data_args.video_column_name, Video(decode=False))
 
     def collate_fn(examples):
         # Filter out examples with None pixel_values (corrupted videos).
@@ -405,7 +359,7 @@ def main():
     kwargs = {
         "finetuned_from": model_args.model_name_or_path,
         "tasks": "embedded-prediction",
-        "dataset": data_args.dataset_name,
+        "dataset": data_args.train_dir,
         "tags": ["embedded-prediction", "video", "3d"],
     }
     if training_args.push_to_hub:
