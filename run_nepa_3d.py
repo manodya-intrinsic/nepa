@@ -17,6 +17,7 @@ from 2D images to 3D video clips with tubelet embedding.
 """
 
 import logging
+from collections import deque
 import os
 import random
 import sys
@@ -43,6 +44,7 @@ from transformers import HfArgumentParser, TrainerCallback, TrainingArguments, s
 from transformers.trainer_utils import get_last_checkpoint
 
 from models.vit_nepa.modeling_vit_nepa_3d import ViTNepaVideoForPreTraining
+from models.vit_nepa.modeling_vit_nepa import prediction_loss
 from models.vit_nepa.configuration_vit_nepa import ViTNepaConfig
 from run_nepa import EnhancedTrainer
 
@@ -79,6 +81,15 @@ def _configure_quiet_logging():
 
 
 class LossOnlyCallback(TrainerCallback):
+    """Compact loss logging with a small moving-average window for readability.
+
+    Prints: [step X] nepa_loss=Y.yy avgN=Z.zz lr=... grad_norm=... emb_var=...
+    """
+
+    def __init__(self, window: int = 20):
+        self.window = window
+        self.recent = deque(maxlen=window)
+
     def on_log(self, args, state, control, logs=None, **kwargs):
         if not logs or state.is_world_process_zero is False:
             return control
@@ -87,13 +98,45 @@ class LossOnlyCallback(TrainerCallback):
         if loss is None:
             return control
 
-        parts = [f"[step {state.global_step}]", f"loss={loss:.4f}"]
+        # store recent losses and compute moving average
+        self.recent.append(float(loss))
+        avg = sum(self.recent) / len(self.recent)
+
+        parts = [f"[step {state.global_step}]", f"nepa_loss={loss:.4f}", f"avg{len(self.recent)}={avg:.4f}"]
         if "learning_rate" in logs:
             parts.append(f"lr={logs['learning_rate']:.2e}")
         if "grad_norm" in logs:
             parts.append(f"grad_norm={logs['grad_norm']:.2f}")
+
+        model = kwargs.get("model")
+        emb_var = getattr(model, "_last_embedding_variance", None) if model is not None else None
+        if emb_var is not None:
+            parts.append(f"emb_var={emb_var:.4f}")
+
         print(" | ".join(parts))
         return control
+
+
+class VideoPretrainTrainer(EnhancedTrainer):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        pixel_values = inputs["pixel_values"]
+        bool_masked_pos = inputs["bool_masked_pos"]
+
+        outputs = model.vit_nepa(
+            pixel_values=pixel_values,
+            bool_masked_pos=bool_masked_pos,
+        )
+
+        sequence_input = outputs.input_embedding
+        sequence_output = outputs.last_hidden_state
+        loss = prediction_loss(sequence_input, sequence_output).float()
+
+        with torch.no_grad():
+            token_states = sequence_output[:, 1:, :].float() if sequence_output.shape[1] > 1 else sequence_output.float()
+            embedding_variance = token_states.var(dim=0, unbiased=False).mean()
+            model._last_embedding_variance = float(embedding_variance.detach().cpu())
+
+        return (loss, outputs) if return_outputs else loss
 
 
 @dataclass
@@ -460,7 +503,7 @@ def main():
             dataset["validation"] = dataset["validation"].shuffle(seed=training_args.seed).select(range(data_args.max_eval_samples))
         dataset["validation"].set_transform(val_transforms)
 
-    trainer = EnhancedTrainer(
+    trainer = VideoPretrainTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset["train"] if training_args.do_train else None,
