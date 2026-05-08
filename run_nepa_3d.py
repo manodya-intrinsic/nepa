@@ -70,12 +70,12 @@ def _configure_quiet_warnings():
 
 
 def _configure_quiet_logging():
-    logging.getLogger().setLevel(logging.ERROR)
+    logging.getLogger().setLevel(logging.WARNING)
     logging.getLogger("transformers").setLevel(logging.ERROR)
     logging.getLogger("datasets").setLevel(logging.ERROR)
     logging.getLogger("torchvision").setLevel(logging.ERROR)
     logging.getLogger("wandb").setLevel(logging.ERROR)
-    logger.setLevel(logging.ERROR)
+    logger.setLevel(logging.INFO)  # Keep our logger at INFO to see debug messages
 
 
 class LossOnlyCallback(TrainerCallback):
@@ -194,6 +194,10 @@ def _video_to_clip_tensor(video_path: str, num_frames: int, spatial_size: int, t
         frame_indices = _sample_frame_indices(total_frames, num_frames, train=train)
         frames_np = vr.get_batch(frame_indices.cpu().numpy()).asnumpy()  # (T, H, W, C)
         video = torch.from_numpy(frames_np).permute(0, 3, 1, 2)  # (T, C, H, W)
+        
+        # DEBUG: Log frame details
+        logger.info(f"[DECODE] {video_path}: {total_frames} total frames, sampled {len(frame_indices)}, shape={video.shape}, dtype={video.dtype}, range=[{video.min():.1f}, {video.max():.1f}]")
+        
     except Exception as e:
         logger.warning(f"Decord failed for {video_path}: {e}. Returning None.")
         return None
@@ -288,6 +292,34 @@ def main():
     if data_args.video_column_name not in (dataset["train"].column_names if "train" in dataset else dataset["validation"].column_names):
         raise ValueError(f"--video_column_name {data_args.video_column_name} not found in the dataset columns.")
 
+    # ========================================================================
+    # DEBUG: Dataset structure and first-batch inspection
+    # ========================================================================
+    if training_args.do_train and "train" in dataset:
+        train_dataset = dataset["train"]
+        print("\n" + "="*70)
+        print("[DEBUG] DATASET STRUCTURE")
+        print("="*70)
+        print(f"Train dataset size: {len(train_dataset)}")
+        print(f"Train dataset columns: {train_dataset.column_names}")
+        print(f"Train dataset features: {train_dataset.features}")
+        
+        # Peek at first 5 video paths
+        print("\n[DEBUG] First 5 video entries (raw):")
+        for i in range(min(5, len(train_dataset))):
+            entry = train_dataset[i]
+            video_item = entry.get(data_args.video_column_name)
+            print(f"  [{i}] type={type(video_item).__name__}, value={video_item}")
+            try:
+                resolved_path = _resolve_video_path(video_item)
+                print(f"       -> resolved to: {resolved_path}")
+            except Exception as e:
+                print(f"       -> FAILED to resolve: {e}")
+        
+        if training_args.do_eval and "validation" in dataset:
+            val_dataset = dataset["validation"]
+            print(f"\nValidation dataset size: {len(val_dataset)}")
+
     def collate_fn(examples):
         # Filter out examples with None pixel_values (corrupted videos).
         valid_examples = [ex for ex in examples if ex["pixel_values"] is not None]
@@ -300,6 +332,20 @@ def main():
         else:
             pixel_values = torch.stack([example["pixel_values"] for example in valid_examples])
 
+        # ====================================================================
+        # DEBUG: Check pixel_values and batch structure
+        # ====================================================================
+        print(f"\n[DEBUG COLLATE] Batch shape: {pixel_values.shape}, dtype: {pixel_values.dtype}")
+        print(f"[DEBUG COLLATE] pixel_values range: [{pixel_values.min():.4f}, {pixel_values.max():.4f}]")
+        print(f"[DEBUG COLLATE] pixel_values mean: {pixel_values.mean():.4f}, std: {pixel_values.std():.4f}")
+        
+        if torch.isnan(pixel_values).any():
+            print("[DEBUG COLLATE] ⚠️  WARNING: pixel_values contains NaN!")
+        if torch.isinf(pixel_values).any():
+            print("[DEBUG COLLATE] ⚠️  WARNING: pixel_values contains Inf!")
+        if (pixel_values == 0).all():
+            print("[DEBUG COLLATE] ⚠️  WARNING: pixel_values is ALL ZEROS!")
+        
         batch_size = pixel_values.shape[0]
         num_tokens = 2048
         num_masked = 1843
@@ -308,6 +354,9 @@ def main():
         for i in range(batch_size):
             masked_indices = torch.randperm(num_tokens)[:num_masked]
             bool_masked_pos[i, masked_indices] = True
+
+        print(f"[DEBUG COLLATE] bool_masked_pos shape: {bool_masked_pos.shape}, num_true: {bool_masked_pos.sum()} per sample")
+        print("="*70)
 
         return {"pixel_values": pixel_values, "bool_masked_pos": bool_masked_pos}
 
@@ -359,6 +408,19 @@ def main():
             _video_to_clip_tensor(_resolve_video_path(video_item), data_args.num_frames, data_args.resize_size, True)
             for video_item in video_entries
         ]
+        
+        # DEBUG: Log first video in first batch
+        if not hasattr(train_transforms, "_debug_logged"):
+            print("\n[DEBUG TRANSFORM] First training batch sample:")
+            for i, (video_item, pv) in enumerate(zip(video_entries, pixel_values)):
+                resolved = _resolve_video_path(video_item)
+                print(f"  Video {i}: path={resolved}")
+                if pv is not None:
+                    print(f"    -> decoded shape={pv.shape}, dtype={pv.dtype}, range=[{pv.min():.4f}, {pv.max():.4f}]")
+                else:
+                    print(f"    -> FAILED to decode (returned None)")
+            train_transforms._debug_logged = True
+        
         example_batch["pixel_values"] = pixel_values
         return example_batch
 
@@ -368,6 +430,19 @@ def main():
             _video_to_clip_tensor(_resolve_video_path(video_item), data_args.num_frames, data_args.resize_size, False)
             for video_item in video_entries
         ]
+        
+        # DEBUG: Log first video in first validation batch
+        if not hasattr(val_transforms, "_debug_logged"):
+            print("\n[DEBUG TRANSFORM] First validation batch sample:")
+            for i, (video_item, pv) in enumerate(zip(video_entries, pixel_values)):
+                resolved = _resolve_video_path(video_item)
+                print(f"  Video {i}: path={resolved}")
+                if pv is not None:
+                    print(f"    -> decoded shape={pv.shape}, dtype={pv.dtype}, range=[{pv.min():.4f}, {pv.max():.4f}]")
+                else:
+                    print(f"    -> FAILED to decode (returned None)")
+            val_transforms._debug_logged = True
+        
         example_batch["pixel_values"] = pixel_values
         return example_batch
 
