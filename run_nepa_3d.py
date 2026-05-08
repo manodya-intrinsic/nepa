@@ -20,10 +20,13 @@ import logging
 import os
 import random
 import sys
+import warnings
 from dataclasses import dataclass, field
 from typing import Optional
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("WANDB_DISABLED", "true")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
 import torch
 from datasets import ClassLabel, Video, load_dataset
@@ -47,6 +50,34 @@ from run_nepa import EnhancedTrainer
 logger = logging.getLogger(__name__)
 
 
+def _configure_quiet_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message="The video decoding and encoding capabilities of torchvision are deprecated.*",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="Parameter 'transform'.*couldn't be hashed properly.*",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=".*libtorchcodec.*",
+        category=UserWarning,
+    )
+    warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
+
+
+def _configure_quiet_logging():
+    logging.getLogger().setLevel(logging.ERROR)
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+    logging.getLogger("datasets").setLevel(logging.ERROR)
+    logging.getLogger("torchvision").setLevel(logging.ERROR)
+    logging.getLogger("wandb").setLevel(logging.ERROR)
+    logger.setLevel(logging.ERROR)
+
+
 class LossOnlyCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
         if not logs or state.is_world_process_zero is False:
@@ -56,7 +87,7 @@ class LossOnlyCallback(TrainerCallback):
         if loss is None:
             return control
 
-        parts = [f"step={state.global_step}", f"loss={loss:.4f}"]
+        parts = [f"[step {state.global_step}]", f"loss={loss:.4f}"]
         if "learning_rate" in logs:
             parts.append(f"lr={logs['learning_rate']:.2e}")
         if "grad_norm" in logs:
@@ -217,13 +248,16 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    _configure_quiet_warnings()
+
     logging.basicConfig(
         format="%(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
 
     training_args.disable_tqdm = True
-    logger.setLevel(logging.ERROR)
+    training_args.report_to = []
+    _configure_quiet_logging()
     transformers.utils.logging.set_verbosity_error()
     transformers.utils.logging.disable_default_handler()
     transformers.utils.logging.disable_explicit_format()
@@ -258,7 +292,6 @@ def main():
         valid_examples = [ex for ex in examples if ex["pixel_values"] is not None]
         if not valid_examples:
             # Keep training moving by emitting a single zero clip instead of a size-0 batch.
-            logger.warning("All examples in batch are corrupted. Returning a zero clip fallback.")
             pixel_values = torch.zeros(
                 (1, 3, data_args.num_frames, data_args.resize_size, data_args.resize_size),
                 dtype=torch.float32,
