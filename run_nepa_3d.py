@@ -88,12 +88,16 @@ class ModelArguments:
 
 
 def _resolve_video_path(video_entry) -> str:
+    if hasattr(video_entry, "path") and video_entry.path is not None:
+        return video_entry.path
+    if hasattr(video_entry, "local_path") and video_entry.local_path is not None:
+        return video_entry.local_path
     if isinstance(video_entry, dict):
         if video_entry.get("path") is not None:
             return video_entry["path"]
+        if video_entry.get("local_path") is not None:
+            return video_entry["local_path"]
         raise ValueError(f"Video entry does not contain a path: {video_entry}")
-    if hasattr(video_entry, "path") and video_entry.path is not None:
-        return video_entry.path
     return str(video_entry)
 
 
@@ -307,6 +311,9 @@ def main():
 
     def train_transforms(example_batch):
         video_entries = _get_video_entries(example_batch, data_args.video_column_name)
+        if not getattr(train_transforms, "_debug_logged", False) and len(video_entries) > 0:
+            logger.warning(f"First video entry type: {type(video_entries[0])}, value: {video_entries[0]}")
+            train_transforms._debug_logged = True
         pixel_values = [
             _video_to_clip_tensor(_resolve_video_path(video_item), data_args.num_frames, data_args.resize_size, True)
             for video_item in video_entries
