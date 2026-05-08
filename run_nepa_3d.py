@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
-from datasets import ClassLabel, load_dataset
+from datasets import ClassLabel, Video, load_dataset
 from PIL import Image
 try:
     from decord import VideoReader, cpu as decord_cpu
@@ -232,6 +232,9 @@ def main():
     if data_args.validation_dir is not None:
         data_files["validation"] = os.path.join(data_args.validation_dir, "**")
     dataset = load_dataset("videofolder", data_files=data_files, cache_dir=model_args.cache_dir)
+
+    # Keep the dataset from auto-decoding videos with TorchCodec; Decord handles decoding in the transform.
+    dataset = dataset.cast_column(data_args.video_column_name, Video(decode=False))
 
     if data_args.video_column_name not in (dataset["train"].column_names if "train" in dataset else dataset["validation"].column_names):
         raise ValueError(f"--video_column_name {data_args.video_column_name} not found in the dataset columns.")
