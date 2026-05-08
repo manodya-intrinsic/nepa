@@ -23,6 +23,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+
 import torch
 from datasets import ClassLabel, Video, load_dataset
 from PIL import Image
@@ -34,7 +36,7 @@ except Exception:
 from torchvision.transforms import CenterCrop, Compose, Lambda, Normalize, RandomHorizontalFlip, RandomResizedCrop, Resize, ToTensor
 
 import transformers
-from transformers import HfArgumentParser, TrainingArguments, set_seed
+from transformers import HfArgumentParser, TrainerCallback, TrainingArguments, set_seed
 from transformers.trainer_utils import get_last_checkpoint
 
 from models.vit_nepa.modeling_vit_nepa_3d import ViTNepaVideoForPreTraining
@@ -43,6 +45,24 @@ from run_nepa import EnhancedTrainer
 
 
 logger = logging.getLogger(__name__)
+
+
+class LossOnlyCallback(TrainerCallback):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs or state.is_world_process_zero is False:
+            return control
+
+        loss = logs.get("loss")
+        if loss is None:
+            return control
+
+        parts = [f"step={state.global_step}", f"loss={loss:.4f}"]
+        if "learning_rate" in logs:
+            parts.append(f"lr={logs['learning_rate']:.2e}")
+        if "grad_norm" in logs:
+            parts.append(f"grad_norm={logs['grad_norm']:.2f}")
+        print(" | ".join(parts))
+        return control
 
 
 @dataclass
@@ -198,25 +218,15 @@ def main():
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
+        format="%(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
 
-    if training_args.should_log:
-        transformers.utils.logging.set_verbosity_info()
-
-    log_level = training_args.get_process_log_level()
-    logger.setLevel(log_level)
-    transformers.utils.logging.set_verbosity(log_level)
-    transformers.utils.logging.enable_default_handler()
-    transformers.utils.logging.enable_explicit_format()
-
-    logger.warning(
-        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}, "
-        + f"distributed training: {training_args.parallel_mode.value == 'distributed'}, 16-bits training: {training_args.fp16}"
-    )
-    logger.info(f"Training/evaluation parameters {training_args}")
+    training_args.disable_tqdm = True
+    logger.setLevel(logging.ERROR)
+    transformers.utils.logging.set_verbosity_error()
+    transformers.utils.logging.disable_default_handler()
+    transformers.utils.logging.disable_explicit_format()
 
     # Prevent Trainer from removing video/label columns before dataset transforms can access them
     training_args.remove_unused_columns = False
@@ -311,9 +321,6 @@ def main():
 
     def train_transforms(example_batch):
         video_entries = _get_video_entries(example_batch, data_args.video_column_name)
-        if not getattr(train_transforms, "_debug_logged", False) and len(video_entries) > 0:
-            logger.warning(f"First video entry type: {type(video_entries[0])}, value: {video_entries[0]}")
-            train_transforms._debug_logged = True
         pixel_values = [
             _video_to_clip_tensor(_resolve_video_path(video_item), data_args.num_frames, data_args.resize_size, True)
             for video_item in video_entries
@@ -352,6 +359,7 @@ def main():
         processing_class=None,
         data_collator=collate_fn,
         embed_lr=model_args.embed_lr,
+        callbacks=[LossOnlyCallback()],
     )
 
     if training_args.do_train:
@@ -362,20 +370,16 @@ def main():
             checkpoint = last_checkpoint
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         trainer.save_model()
-        trainer.log_metrics("train", train_result.metrics)
-        trainer.save_metrics("train", train_result.metrics)
         trainer.save_state()
 
-    kwargs = {
-        "finetuned_from": model_args.model_name_or_path,
-        "tasks": "embedded-prediction",
-        "dataset": data_args.train_dir,
-        "tags": ["embedded-prediction", "video", "3d"],
-    }
     if training_args.push_to_hub:
+        kwargs = {
+            "finetuned_from": model_args.model_name_or_path,
+            "tasks": "embedded-prediction",
+            "dataset": data_args.train_dir,
+            "tags": ["embedded-prediction", "video", "3d"],
+        }
         trainer.push_to_hub(**kwargs)
-    else:
-        trainer.create_model_card(**kwargs)
 
 
 if __name__ == "__main__":
