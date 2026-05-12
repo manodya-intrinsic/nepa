@@ -522,9 +522,9 @@ def main():
     )
     config.num_labels = model_args.num_labels
 
-    data_files = {"train": os.path.join(data_args.train_dir, "**")}
+    data_files = {"train": data_args.train_dir}
     if data_args.validation_dir is not None:
-        data_files["validation"] = os.path.join(data_args.validation_dir, "**")
+        data_files["validation"] = data_args.validation_dir
 
     dataset = load_dataset("videofolder", data_files=data_files, cache_dir=model_args.cache_dir)
     dataset = dataset.cast_column(data_args.video_column_name, Video(decode=False))
