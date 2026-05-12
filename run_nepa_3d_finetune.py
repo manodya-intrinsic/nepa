@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import transformers
 from PIL import Image as PILImage
-from datasets import Video, load_dataset, Dataset, Features, ClassLabel
+from datasets import Video, load_dataset, Dataset, Features, ClassLabel, Value
 from torchvision.transforms import CenterCrop, Compose, Lambda, RandomHorizontalFlip, RandomResizedCrop, Resize, ToTensor
 from transformers import HfArgumentParser, Trainer, TrainingArguments, set_seed
 from transformers.trainer_utils import get_last_checkpoint
@@ -527,7 +527,11 @@ def main():
     from pathlib import Path
     
     def build_dataset_from_directory(root_dir: str, max_samples: Optional[int] = None):
-        """Build dataset by scanning directory structure for videos."""
+        """Build dataset by scanning directory structure for videos.
+        
+        Uses Value("string") to store video paths as strings, avoiding torchcodec issues.
+        VideoCollator handles actual decoding with Decord.
+        """
         root_path = Path(root_dir)
         videos = []
         labels = []
@@ -551,15 +555,17 @@ def main():
         if not videos:
             raise ValueError(f"No .avi files found in {root_dir}")
         
-        # Create dataset dict
+        # Create dataset dict with string paths (not Video objects)
+        # This avoids torchcodec import which is incompatible with Torch 2.4.1
         data_dict = {
             "video": videos,
             "label": labels,
         }
         
-        # Create dataset with Video feature (non-decoded)
+        # Use Value("string") instead of Video() to store paths as strings
+        # VideoCollator will decode with Decord
         features = Features({
-            "video": Video(decode=False),
+            "video": Value("string"),
             "label": ClassLabel(num_classes=len(class_to_idx), names=sorted(class_to_idx.keys())),
         })
         
