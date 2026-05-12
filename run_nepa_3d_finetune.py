@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import transformers
 from PIL import Image as PILImage
-from datasets import Video, load_dataset
+from datasets import Video, load_dataset, Dataset, Features, ClassLabel
 from torchvision.transforms import CenterCrop, Compose, Lambda, RandomHorizontalFlip, RandomResizedCrop, Resize, ToTensor
 from transformers import HfArgumentParser, Trainer, TrainingArguments, set_seed
 from transformers.trainer_utils import get_last_checkpoint
@@ -522,26 +522,58 @@ def main():
     )
     config.num_labels = model_args.num_labels
 
-    # Load train and validation datasets using videofolder loader with data_dir
-    logger.info("Loading dataset from %s", data_args.train_dir)
-    dataset = load_dataset(
-        "videofolder",
-        data_dir=data_args.train_dir,
-        cache_dir=model_args.cache_dir
-    )
+    # Load train and validation datasets by scanning directory structure directly
+    # This avoids torchcodec dependency issues
+    from pathlib import Path
     
-    train_dataset = dataset.get("train")
-    eval_dataset = dataset.get("validation") or dataset.get("val")
+    def build_dataset_from_directory(root_dir: str, max_samples: Optional[int] = None):
+        """Build dataset by scanning directory structure for videos."""
+        root_path = Path(root_dir)
+        videos = []
+        labels = []
+        class_to_idx = {}
+        
+        for class_idx, class_dir in enumerate(sorted(root_path.iterdir())):
+            if not class_dir.is_dir():
+                continue
+            class_name = class_dir.name
+            class_to_idx[class_name] = class_idx
+            
+            for video_path in sorted(class_dir.glob("*.avi")):
+                if max_samples is not None and len(videos) >= max_samples:
+                    break
+                videos.append(str(video_path))
+                labels.append(class_idx)
+            
+            if max_samples is not None and len(videos) >= max_samples:
+                break
+        
+        if not videos:
+            raise ValueError(f"No .avi files found in {root_dir}")
+        
+        # Create dataset dict
+        data_dict = {
+            "video": videos,
+            "label": labels,
+        }
+        
+        # Create dataset with Video feature (non-decoded)
+        features = Features({
+            "video": Video(decode=False),
+            "label": ClassLabel(num_classes=len(class_to_idx), names=sorted(class_to_idx.keys())),
+        })
+        
+        dataset = Dataset.from_dict(data_dict, features=features)
+        logger.info(f"Built dataset from {root_dir}: {len(dataset)} videos, {len(class_to_idx)} classes")
+        return dataset
     
-    if train_dataset is None:
-        raise ValueError(f"No 'train' split found in dataset. Available splits: {list(dataset.keys())}")
+    logger.info("Loading dataset from %s (scanning directory structure)", data_args.train_dir)
+    train_dataset = build_dataset_from_directory(data_args.train_dir, data_args.max_train_samples)
     
-    # Apply max_samples if specified
-    if data_args.max_train_samples is not None:
-        train_dataset = train_dataset.select(range(min(len(train_dataset), data_args.max_train_samples)))
-    
-    if data_args.max_eval_samples is not None and eval_dataset is not None:
-        eval_dataset = eval_dataset.select(range(min(len(eval_dataset), data_args.max_eval_samples)))
+    eval_dataset = None
+    if training_args.do_eval and data_args.validation_dir is not None:
+        logger.info("Loading validation dataset from %s", data_args.validation_dir)
+        eval_dataset = build_dataset_from_directory(data_args.validation_dir, data_args.max_eval_samples)
     
     logger.info("Train dataset size: %s", len(train_dataset))
     if eval_dataset is not None:
