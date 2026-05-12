@@ -522,32 +522,30 @@ def main():
     )
     config.num_labels = model_args.num_labels
 
-    data_files = {"train": data_args.train_dir}
-    if data_args.validation_dir is not None:
-        data_files["validation"] = data_args.validation_dir
-
-    dataset = load_dataset("videofolder", data_files=data_files, cache_dir=model_args.cache_dir)
-    dataset = dataset.cast_column(data_args.video_column_name, Video(decode=False))
-
-    train_dataset = None
-    eval_dataset = None
-    if training_args.do_train:
-        train_dataset = dataset["train"]
-        if data_args.max_train_samples is not None:
-            train_dataset = train_dataset.select(range(min(data_args.max_train_samples, len(train_dataset))))
-    if training_args.do_eval and "validation" in dataset:
-        eval_dataset = dataset["validation"]
-        if data_args.max_eval_samples is not None:
-            eval_dataset = eval_dataset.select(range(min(data_args.max_eval_samples, len(eval_dataset))))
-
-    if "train" in dataset:
-        logger.info("Train dataset size: %s", len(dataset["train"]))
-        logger.info("Train dataset columns: %s", dataset["train"].column_names)
-        label_feature = dataset["train"].features.get("label")
-        if label_feature is not None and hasattr(label_feature, "names"):
-            logger.info("Train label names: %s", label_feature.names)
-    if "validation" in dataset:
-        logger.info("Validation dataset size: %s", len(dataset["validation"]))
+    # Load train and validation datasets using videofolder loader with data_dir
+    logger.info("Loading dataset from %s", data_args.train_dir)
+    dataset = load_dataset(
+        "videofolder",
+        data_dir=data_args.train_dir,
+        cache_dir=model_args.cache_dir
+    )
+    
+    train_dataset = dataset.get("train")
+    eval_dataset = dataset.get("validation") or dataset.get("val")
+    
+    if train_dataset is None:
+        raise ValueError(f"No 'train' split found in dataset. Available splits: {list(dataset.keys())}")
+    
+    # Apply max_samples if specified
+    if data_args.max_train_samples is not None:
+        train_dataset = train_dataset.select(range(min(len(train_dataset), data_args.max_train_samples)))
+    
+    if data_args.max_eval_samples is not None and eval_dataset is not None:
+        eval_dataset = eval_dataset.select(range(min(len(eval_dataset), data_args.max_eval_samples)))
+    
+    logger.info("Train dataset size: %s", len(train_dataset))
+    if eval_dataset is not None:
+        logger.info("Validation dataset size: %s", len(eval_dataset))
 
     model = ViTNepaVideoForActionClassification(config, num_labels=model_args.num_labels)
     trainable_backbone = sum(p.numel() for p in model.vit_nepa.parameters() if p.requires_grad)
