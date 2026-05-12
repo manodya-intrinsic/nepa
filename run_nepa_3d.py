@@ -88,9 +88,11 @@ class VideoPretrainTrainer(EnhancedTrainer):
                 epoch = self.state.epoch if self.state.epoch is not None else 0.0
                 lr = logs.get("learning_rate", logs.get("lr", float("nan")))
                 grad_norm = logs.get("grad_norm", float("nan"))
+                # Embedding variance indicates feature diversity (collapse = very low variance)
+                emb_var = getattr(self.model.model, "_last_embedding_variance", float("nan"))
                 print(
                     f"Step {self.state.global_step} | Epoch {epoch:.2f} | Loss {float(loss):.4f} | "
-                    f"Sim {-float(loss):.4f} | LR {float(lr):.2e} | Grad {float(grad_norm):.2f}"
+                    f"Sim {-float(loss):.4f} | LR {float(lr):.2e} | Grad {float(grad_norm):.2f} | Var {float(emb_var):.4f}"
                 )
 
         return super().log(logs, start_time=start_time)
@@ -106,6 +108,15 @@ class VideoPretrainTrainer(EnhancedTrainer):
 
         sequence_input = outputs.input_embedding
         sequence_output = outputs.last_hidden_state
+
+        # Mirror prediction_loss(shift=True) tensors and guard against accidental leakage.
+        pred = F.normalize(sequence_output[:, :-1, :], dim=-1)
+        target = F.normalize(sequence_input[:, 1:, :].detach(), dim=-1)
+        if torch.allclose(pred, target, atol=1e-3):
+            raise AssertionError(
+                "pred and target are allclose(atol=1e-3) before loss; check for data leakage or wiring bugs."
+            )
+
         loss = prediction_loss(sequence_input, sequence_output).float()
 
         with torch.no_grad():
@@ -382,7 +393,8 @@ def main():
             masked_indices = torch.randperm(num_tokens)[:num_masked]
             bool_masked_pos[i, masked_indices] = True
 
-            print(f"[DEBUG COLLATE] bool_masked_pos shape: {bool_masked_pos.shape}, num_true: {bool_masked_pos.sum()} per sample")
+            num_masked_per_sample = bool_masked_pos[i].sum().item()
+            print(f"[DEBUG COLLATE] bool_masked_pos shape: {bool_masked_pos.shape}, num_true: {num_masked_per_sample} per sample")
             print("="*70)
 
         return {"pixel_values": pixel_values, "bool_masked_pos": bool_masked_pos}
