@@ -30,6 +30,7 @@ os.environ.setdefault("WANDB_DISABLED", "true")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
 import torch
+import torch.nn.functional as F
 from datasets import ClassLabel, Video, load_dataset
 from PIL import Image
 try:
