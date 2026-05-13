@@ -90,7 +90,7 @@ class VideoPretrainTrainer(EnhancedTrainer):
                 lr = logs.get("learning_rate", logs.get("lr", float("nan")))
                 grad_norm = logs.get("grad_norm", float("nan"))
                 # Embedding variance indicates feature diversity (collapse = very low variance)
-                emb_var = getattr(self.model.model, "_last_embedding_variance", float("nan"))
+                emb_var = getattr(self.model, "_last_embedding_variance", float("nan"))
                 print(
                     f"Step {self.state.global_step} | Epoch {epoch:.2f} | Loss {float(loss):.4f} | "
                     f"Sim {-float(loss):.4f} | LR {float(lr):.2e} | Grad {float(grad_norm):.2f} | Var {float(emb_var):.4f}"
