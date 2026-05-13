@@ -632,6 +632,12 @@ def main():
         training_args.evaluation_strategy = "no"
     if hasattr(training_args, "eval_strategy"):
         training_args.eval_strategy = "no"
+    
+    # Fix learning rate scheduler: use constant_with_warmup instead of linear decay
+    # This ensures LR warms up then stays at target value, not decay to 0
+    if not hasattr(training_args, "lr_scheduler_type") or training_args.lr_scheduler_type is None:
+        training_args.lr_scheduler_type = "constant_with_warmup"
+        logger.info("Set lr_scheduler_type to 'constant_with_warmup' to prevent LR decay")
 
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
