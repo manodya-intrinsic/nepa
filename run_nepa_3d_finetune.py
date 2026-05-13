@@ -514,6 +514,12 @@ def main():
     if config_source is None:
         raise ValueError("You must pass --config_name or --model_name_or_path.")
 
+    # Resolve config path: convert relative paths to absolute
+    if config_source and not os.path.isabs(config_source) and not config_source.startswith(("http", "s3")):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        config_source = os.path.join(script_dir, config_source)
+        logger.info("Resolved config path to: %s", config_source)
+
     config = ViTNepaConfig.from_pretrained(
         config_source,
         cache_dir=model_args.cache_dir,
