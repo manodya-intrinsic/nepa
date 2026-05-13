@@ -471,14 +471,47 @@ def _load_pretrained_weights(model: ViTNepaVideoForActionClassification, pretrai
 
 
 class EpochAccuracyCallback(TrainerCallback):
-    """Callback to log accuracy after each evaluation."""
+    """Callback to log learning behavior at each step and epoch."""
+    
+    def __init__(self):
+        self.last_logged_epoch = -1
+        self.last_logged_step = -1
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        """Log training progress every N steps (early in training)."""
+        current_step = state.global_step
+        
+        # Log every 25 steps in first 100 steps to see early behavior
+        if current_step <= 100 and current_step % 25 == 0:
+            loss = state.log_history[-1].get("loss", None) if state.log_history else None
+            lr = state.log_history[-1].get("learning_rate", None) if state.log_history else None
+            lr_str = f" | LR: {lr:.2e}" if lr is not None else ""
+            loss_str = f" | Loss: {loss:.4f}" if loss is not None else ""
+            print(f"  Step {current_step:5d}{loss_str}{lr_str}")
+    
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        """Log training progress at each epoch boundary."""
+        if logs is None:
+            return
+        
+        current_epoch = state.epoch
+        # Log only at epoch boundaries (when epoch changes)
+        if current_epoch > self.last_logged_epoch and int(current_epoch) > 0:
+            self.last_logged_epoch = int(current_epoch)
+            loss = logs.get("loss", None)
+            learning_rate = logs.get("learning_rate", None)
+            
+            lr_str = f" | LR: {learning_rate:.2e}" if learning_rate is not None else ""
+            loss_str = f" | Train Loss: {loss:.4f}" if loss is not None else ""
+            print(f"[Epoch {int(current_epoch):2d}/30]{loss_str}{lr_str}")
     
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        """Log evaluation metrics after validation."""
         if metrics is not None:
             epoch = state.epoch
             accuracy = metrics.get("eval_accuracy", 0.0)
-            loss = metrics.get("eval_loss", 0.0)
-            print(f"Epoch {epoch:.1f} | Eval Accuracy: {accuracy:.4f} | Eval Loss: {loss:.4f}")
+            eval_loss = metrics.get("eval_loss", 0.0)
+            print(f"  ↳ Eval @ Epoch {epoch:.1f} | Accuracy: {accuracy:.4f} | Eval Loss: {eval_loss:.4f}")
 
 
 def _run_sanity_check(model: ViTNepaVideoForActionClassification, collator: VideoCollator, train_dataset):
