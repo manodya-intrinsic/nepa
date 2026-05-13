@@ -329,7 +329,37 @@ def compute_metrics(eval_pred):
 
     predicted_labels = np.argmax(predictions, axis=1)
     accuracy = (predicted_labels == labels).mean()
-    return {"accuracy": float(accuracy)}
+    f1 = _macro_f1_score(predicted_labels, labels)
+    return {"accuracy": float(accuracy), "f1": float(f1)}
+
+
+def _macro_f1_score(predicted_labels: np.ndarray, labels: np.ndarray) -> float:
+    predicted_labels = np.asarray(predicted_labels).reshape(-1)
+    labels = np.asarray(labels).reshape(-1)
+
+    if predicted_labels.size == 0 or labels.size == 0:
+        return 0.0
+
+    num_classes = int(max(predicted_labels.max(), labels.max())) + 1
+    f1_scores = []
+
+    for class_id in range(num_classes):
+        true_positive = np.sum((predicted_labels == class_id) & (labels == class_id))
+        false_positive = np.sum((predicted_labels == class_id) & (labels != class_id))
+        false_negative = np.sum((predicted_labels != class_id) & (labels == class_id))
+
+        precision_denominator = true_positive + false_positive
+        recall_denominator = true_positive + false_negative
+
+        precision = true_positive / precision_denominator if precision_denominator > 0 else 0.0
+        recall = true_positive / recall_denominator if recall_denominator > 0 else 0.0
+
+        if precision + recall == 0.0:
+            f1_scores.append(0.0)
+        else:
+            f1_scores.append(2.0 * precision * recall / (precision + recall))
+
+    return float(np.mean(f1_scores)) if f1_scores else 0.0
 
 
 def _assert_config_match(source_config: ViTNepaConfig, target_config: ViTNepaConfig):
@@ -471,11 +501,17 @@ def _load_pretrained_weights(model: ViTNepaVideoForActionClassification, pretrai
 
 
 class EpochAccuracyCallback(TrainerCallback):
-    """Callback to log learning behavior at each step and epoch."""
+    """Callback to log step progress and full epoch summaries."""
     
-    def __init__(self):
+    def __init__(self, total_epochs: int = 0):
         self.last_logged_epoch = -1
         self.last_logged_step = -1
+        self.best_val_accuracy = float("-inf")
+        self.total_epochs = total_epochs
+        self.trainer = None
+
+    def attach_trainer(self, trainer):
+        self.trainer = trainer
     
     def on_step_end(self, args, state, control, **kwargs):
         """Log training progress every N steps (early in training)."""
@@ -488,6 +524,47 @@ class EpochAccuracyCallback(TrainerCallback):
             lr_str = f" | LR: {lr:.2e}" if lr is not None else ""
             loss_str = f" | Loss: {loss:.4f}" if loss is not None else ""
             print(f"  Step {current_step:5d}{loss_str}{lr_str}")
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        """Print a full epoch summary using train and validation metrics."""
+        if self.trainer is None or self.trainer.train_dataset is None:
+            return
+
+        if not self.trainer.is_world_process_zero():
+            return
+
+        current_epoch = int(round(state.epoch or 0.0))
+        total_epochs = self.total_epochs or int(getattr(args, "num_train_epochs", 0) or 0)
+        phase = "WARMUP" if current_epoch <= 5 else "FULL FT"
+
+        train_metrics = self.trainer.evaluate(
+            eval_dataset=self.trainer.train_dataset,
+            metric_key_prefix="train",
+        )
+
+        val_metrics = {}
+        if self.trainer.eval_dataset is not None:
+            val_metrics = self.trainer.evaluate(
+                eval_dataset=self.trainer.eval_dataset,
+                metric_key_prefix="val",
+            )
+
+        train_acc = train_metrics.get("train_accuracy", 0.0)
+        train_loss = train_metrics.get("train_loss", 0.0)
+        val_acc = val_metrics.get("val_accuracy", 0.0)
+        val_f1 = val_metrics.get("val_f1", 0.0)
+        val_loss = val_metrics.get("val_loss", 0.0)
+
+        best_marker = ""
+        if val_metrics and val_acc >= self.best_val_accuracy:
+            self.best_val_accuracy = val_acc
+            best_marker = f" | NEW BEST ACC: {val_acc * 100:.2f}%"
+
+        print(
+            f"Epoch [{current_epoch:02d}/{total_epochs:02d}] | {phase} | Step {state.global_step} | "
+            f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc * 100:.2f}% | "
+            f"Val Acc: {val_acc * 100:.2f}% | Val F1: {val_f1:.4f} | Val Loss: {val_loss:.4f}{best_marker}"
+        )
     
     def on_log(self, args, state, control, logs=None, **kwargs):
         """Log training progress at each epoch boundary."""
@@ -551,6 +628,10 @@ def main():
     transformers.utils.logging.disable_default_handler()
 
     training_args.remove_unused_columns = False
+    if hasattr(training_args, "evaluation_strategy"):
+        training_args.evaluation_strategy = "no"
+    if hasattr(training_args, "eval_strategy"):
+        training_args.eval_strategy = "no"
 
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
@@ -655,6 +736,8 @@ def main():
     train_collator = VideoCollator(data_args.num_frames, data_args.resize_size, train=True, num_labels=model_args.num_labels)
     eval_collator = VideoCollator(data_args.num_frames, data_args.resize_size, train=False, num_labels=model_args.num_labels)
 
+    epoch_callback = EpochAccuracyCallback(total_epochs=int(training_args.num_train_epochs))
+
     trainer = VideoActionClassificationTrainer(
         model=model,
         args=training_args,
@@ -663,8 +746,10 @@ def main():
         data_collator=train_collator,
         eval_collator=eval_collator,
         compute_metrics=compute_metrics,
-        callbacks=[EpochAccuracyCallback()],
+        callbacks=[epoch_callback],
     )
+
+    epoch_callback.attach_trainer(trainer)
 
     _run_sanity_check(model, train_collator, train_dataset)
 
