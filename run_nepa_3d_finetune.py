@@ -22,7 +22,7 @@ import transformers
 from PIL import Image as PILImage
 from datasets import Video, load_dataset, Dataset, Features, ClassLabel, Value
 from torchvision.transforms import CenterCrop, Compose, Lambda, RandomHorizontalFlip, RandomResizedCrop, Resize, ToTensor
-from transformers import HfArgumentParser, Trainer, TrainingArguments, set_seed
+from transformers import HfArgumentParser, Trainer, TrainingArguments, set_seed, TrainerCallback
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.trainer_pt_utils import get_parameter_names
 from transformers.utils.import_utils import is_sagemaker_mp_enabled
@@ -244,24 +244,18 @@ class VideoActionClassificationTrainer(Trainer):
         assert opt_model is not None, "Optimizer creation requires a non-None model."
         decay_parameters = set(self.get_decay_parameter_names(opt_model))
 
+        # CRITICAL: Identify head parameters so they DON'T get layer decay
         head_param_ids = set()
         if hasattr(self.model, "classifier"):
             head_param_ids.update(id(p) for p in self.model.classifier.parameters())
+        if hasattr(self.model, "fc_norm"):
+            head_param_ids.update(id(p) for p in self.model.fc_norm.parameters())
 
-        final_ln_ids = set()
-        if hasattr(self.model, "vit_nepa") and hasattr(self.model.vit_nepa, "layernorm"):
-            final_ln_ids.update(id(p) for p in self.model.vit_nepa.layernorm.parameters())
-
-        embeddings_param_ids = set()
-        if hasattr(self.model, "vit_nepa") and hasattr(self.model.vit_nepa, "embeddings"):
-            embeddings_param_ids.update(id(p) for p in self.model.vit_nepa.embeddings.parameters())
-
-        layers_param_ids = []
         encoder_layers = []
-        if hasattr(self.model, "vit_nepa") and hasattr(self.model.vit_nepa, "encoder") and hasattr(self.model.vit_nepa.encoder, "layer"):
+        if (hasattr(self.model, "vit_nepa") and 
+            hasattr(self.model.vit_nepa, "encoder") and 
+            hasattr(self.model.vit_nepa.encoder, "layer")):
             encoder_layers = list(self.model.vit_nepa.encoder.layer)
-            for blk in encoder_layers:
-                layers_param_ids.append(set(id(p) for p in blk.parameters()))
         num_layers = len(encoder_layers)
 
         grouped = {}
@@ -269,29 +263,28 @@ class VideoActionClassificationTrainer(Trainer):
             if not p.requires_grad:
                 continue
 
-            if id(p) in head_param_ids or id(p) in final_ln_ids:
-                lr = head_lr
-                scale = 0
+            # HEAD gets fixed high LR, NO decay
+            if id(p) in head_param_ids:
+                lr = head_lr  # Fixed at 1e-4
+                wd = 0.0 if p.ndim <= 1 else weight_decay
+            
+            # BACKBONE gets decayed LR based on layer depth
             else:
                 lr = backbone_lr
-                scale = 0
-                if id(p) in embeddings_param_ids:
-                    scale = num_layers
-                for i in range(num_layers):
-                    if id(p) in layers_param_ids[i]:
-                        scale = num_layers - 1 - i
+                wd = 0.0 if p.ndim <= 1 else (weight_decay if full_name in decay_parameters else 0.0)
+                
+                # Apply layer decay only to backbone layers
+                for layer_idx, layer in enumerate(encoder_layers):
+                    if any(id(p) == id(param) for param in layer.parameters()):
+                        scale = num_layers - 1 - layer_idx
+                        lr = backbone_lr * (llrd ** scale)
                         break
-                if any(id(p) in layer_ids for layer_ids in layers_param_ids):
-                    lr = backbone_lr * (llrd ** scale)
-                elif id(p) in embeddings_param_ids:
-                    lr = backbone_lr * (llrd ** scale)
 
-            wd = 0.0 if p.ndim <= 1 else (weight_decay if full_name in decay_parameters else 0.0)
-            grouped.setdefault((lr, wd, scale), []).append(p)
+            grouped.setdefault((lr, wd), []).append(p)
 
         optimizer_grouped_parameters = [
-            {"params": params, "lr": lr, "weight_decay": wd, "llrd_scale": scale}
-            for (lr, wd, scale), params in grouped.items()
+            {"params": params, "lr": lr, "weight_decay": wd}
+            for (lr, wd), params in grouped.items()
         ]
 
         optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args)
@@ -426,7 +419,11 @@ def _load_pretrained_weights(model: ViTNepaVideoForActionClassification, pretrai
         _assert_config_match(pretrained_model.config, model.vit_nepa.config)
         state_dict = pretrained_model.state_dict()
     else:
-        checkpoint = torch.load(pretrained_path, map_location="cpu")
+        try:
+            checkpoint = torch.load(pretrained_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            # Backward compatibility for older torch versions without weights_only.
+            checkpoint = torch.load(pretrained_path, map_location="cpu")
         state_dict = _unwrap_checkpoint_state_dict(checkpoint)
         if any(key.startswith("vit_nepa.") for key in state_dict.keys()):
             state_dict = {
@@ -455,6 +452,8 @@ def _load_pretrained_weights(model: ViTNepaVideoForActionClassification, pretrai
         total_params,
         (100.0 * loaded_params / max(total_params, 1)),
     )
+    if loaded_params == 0:
+        raise AssertionError("Loaded 0 encoder parameters from pretrained checkpoint.")
 
     if missing_keys:
         logger.info("Missing keys when loading pretrained weights: %s", missing_keys[:10])
@@ -464,6 +463,22 @@ def _load_pretrained_weights(model: ViTNepaVideoForActionClassification, pretrai
             )
     if unexpected_keys:
         logger.info("Unexpected keys when loading pretrained weights: %s", unexpected_keys[:10])
+
+    print(
+        f"[OK] Pretrained encoder loaded: {loaded_params}/{total_params} parameters "
+        f"({100.0 * loaded_params / max(total_params, 1):.2f}%)"
+    )
+
+
+class EpochAccuracyCallback(TrainerCallback):
+    """Callback to log accuracy after each evaluation."""
+    
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if metrics is not None:
+            epoch = state.epoch
+            accuracy = metrics.get("eval_accuracy", 0.0)
+            loss = metrics.get("eval_loss", 0.0)
+            print(f"Epoch {epoch:.1f} | Eval Accuracy: {accuracy:.4f} | Eval Loss: {loss:.4f}")
 
 
 def _run_sanity_check(model: ViTNepaVideoForActionClassification, collator: VideoCollator, train_dataset):
@@ -495,7 +510,7 @@ def main():
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     _configure_quiet_warnings()
-    logging.basicConfig(format="%(message)s", handlers=[logging.StreamHandler(sys.stdout)])
+    logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=[logging.StreamHandler(sys.stdout)])
     training_args.disable_tqdm = True
     training_args.report_to = []
     _configure_quiet_logging()
@@ -615,6 +630,7 @@ def main():
         data_collator=train_collator,
         eval_collator=eval_collator,
         compute_metrics=compute_metrics,
+        callbacks=[EpochAccuracyCallback()],
     )
 
     _run_sanity_check(model, train_collator, train_dataset)
