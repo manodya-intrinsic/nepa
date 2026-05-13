@@ -472,6 +472,11 @@ def _run_sanity_check(model: ViTNepaVideoForActionClassification, collator: Vide
 
     batch_examples = [train_dataset[i] for i in range(min(1, len(train_dataset)))]
     batch = collator(batch_examples)
+    
+    # Move batch to the same device as the model
+    device = next(model.parameters()).device
+    batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+    
     with torch.no_grad():
         outputs = model(pixel_values=batch["pixel_values"], labels=batch["labels"])
 
