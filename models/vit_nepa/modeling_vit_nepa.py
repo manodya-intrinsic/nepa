@@ -852,7 +852,7 @@ class ViTNepaForPreTraining(ViTNepaPreTrainedModel):
         self,
         pixel_values: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
-        bool_masked_pos: Optional[torch.BoolTensor] = None,
+        # bool_masked_pos: Optional[torch.BoolTensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
         interpolate_pos_encoding: Optional[bool] = None,
@@ -865,7 +865,7 @@ class ViTNepaForPreTraining(ViTNepaPreTrainedModel):
         outputs: BaseModelOutputWithEmbedding = self.vit_nepa(
             pixel_values,
             position_ids=position_ids,
-            bool_masked_pos=bool_masked_pos,
+            # bool_masked_pos=bool_masked_pos,
             head_mask=head_mask,
             output_attentions=output_attentions,
             interpolate_pos_encoding=interpolate_pos_encoding,
