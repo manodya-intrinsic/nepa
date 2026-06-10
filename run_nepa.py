@@ -621,16 +621,16 @@
 
 # if __name__ == "__main__":
 #     main()
-
 """
 Run 2D NEPA pretraining.
 
 Supports two data modes:
-1. ImageFolder (default, original behavior) - for natural images like HMDB51 frames
+1. ImageFolder (default) - for natural images
 2. CT slice dataset (--use_ct_dataset True) - for AbdomenCT-1K preprocessed slices
 
-The ONLY change from the original is the addition of the CT branch in data loading.
-Model, optimizer, trainer, EMA, etc. are completely unchanged.
+The CT path uses AbdomenCTSliceDataset which provides:
+  - pixel_values: (3, 224, 224)
+  - bool_masked_pos: (256,) bool   <-- prevents NEPA collapse on uniform CT data
 """
 
 import logging
@@ -676,7 +676,7 @@ from dataset_abdomenct import AbdomenCTSliceDataset
 
 logger = logging.getLogger(__name__)
 
-require_version("datasets>=2.14.0", "To fix: pip install -r examples/pytorch/image-classification/requirements.txt")
+require_version("datasets>=2.14.0", "To fix: pip install -r requirements.txt")
 
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
@@ -689,7 +689,7 @@ def pil_loader(path: str):
 
 
 class EnhancedTrainer(Trainer):
-    """Unchanged from original - kept here for completeness."""
+    """Trainer with embed_lr support and EMA model tracking."""
 
     def __init__(self, *args, embed_lr=None, ema_decay=0.9999, use_ema=True, **kwargs):
         super().__init__(*args, **kwargs)
@@ -699,8 +699,10 @@ class EnhancedTrainer(Trainer):
         self.ema_model = None
 
     def get_decay_parameter_names(self, model) -> list[str]:
-        forbidden = [r"bias", r"layernorm", r"rmsnorm", r"layer_scale",
-                     r"(?:^|\.)norm(?:$|\.)", r"_norm(?:$|\.)"]
+        forbidden = [
+            r"bias", r"layernorm", r"rmsnorm", r"layer_scale",
+            r"(?:^|\.)norm(?:$|\.)", r"_norm(?:$|\.)",
+        ]
         return get_parameter_names(model, [torch.nn.LayerNorm], forbidden)
 
     def create_optimizer(self):
@@ -795,7 +797,7 @@ class DataTrainingArguments:
     load_from_disk: bool = field(default=False)
     keep_in_memory: bool = field(default=False)
 
-    # NEW: switch to CT dataset mode
+    # Switch to CT dataset mode
     use_ct_dataset: bool = field(
         default=False,
         metadata={"help": "Use AbdomenCTSliceDataset instead of imagefolder. "
@@ -870,7 +872,6 @@ def main():
     # DATA LOADING - branches based on --use_ct_dataset
     # =====================================================================
     if data_args.use_ct_dataset:
-        # ----- CT mode: load preprocessed .npy slices -----
         logger.info(f"Loading CT slice dataset from {data_args.train_dir}")
         train_dataset = AbdomenCTSliceDataset(data_args.train_dir, train=True)
         eval_dataset = None
@@ -878,21 +879,21 @@ def main():
             eval_dataset = AbdomenCTSliceDataset(data_args.validation_dir, train=False)
 
         if data_args.max_train_samples is not None:
-            # Truncate by limiting the internal index
             train_dataset.index = train_dataset.index[: data_args.max_train_samples]
             logger.info(f"Truncated train dataset to {len(train_dataset)} slices")
 
-        # CT dataset already returns torch tensors with the right transforms,
-        # so the collator is trivial
+        # CT collator: pass bool_masked_pos through to the model
         def collate_fn(examples):
             pixel_values = torch.stack([ex["pixel_values"] for ex in examples])
-            return {"pixel_values": pixel_values}
+            batch = {"pixel_values": pixel_values}
+            if "bool_masked_pos" in examples[0]:
+                batch["bool_masked_pos"] = torch.stack([ex["bool_masked_pos"] for ex in examples])
+            return batch
 
-        # No image_processor needed in CT mode - we handle preprocessing ourselves
         image_processor = None
 
     else:
-        # ----- Original imagefolder mode (unchanged) -----
+        # ----- Original imagefolder mode -----
         if data_args.dataset_name is not None:
             if data_args.load_from_disk:
                 dataset = load_from_disk(data_args.dataset_name, keep_in_memory=data_args.keep_in_memory)
@@ -931,7 +932,7 @@ def main():
             dataset["validation"] = split["test"]
 
     # =====================================================================
-    # MODEL  (unchanged)
+    # MODEL
     # =====================================================================
     config = ViTNepaConfig.from_pretrained(
         model_args.config_name or model_args.model_name_or_path,
@@ -955,6 +956,14 @@ def main():
     else:
         logger.info("Training new model from scratch")
         model = ViTNepaForPreTraining(config)
+
+    # In CT mode, ViTNepaModel needs use_mask_token=True so masked positions
+    # get replaced with the learnable mask token instead of being passed through.
+    if data_args.use_ct_dataset:
+        old_state = model.vit_nepa.state_dict()
+        model.vit_nepa = model.vit_nepa.__class__(config, use_mask_token=True)
+        model.vit_nepa.load_state_dict(old_state, strict=False)
+        logger.info("CT mode: enabled mask_token in encoder")
 
     # =====================================================================
     # IMAGE PROCESSOR + TRANSFORMS (only for imagefolder mode)
@@ -1038,7 +1047,7 @@ def main():
         eval_dataset = dataset["validation"] if training_args.do_eval else None
 
     # =====================================================================
-    # TRAINER (unchanged)
+    # TRAINER
     # =====================================================================
     trainer = EnhancedTrainer(
         model=model,

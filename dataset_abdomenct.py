@@ -1,17 +1,17 @@
 """
 PyTorch Dataset for AbdomenCT-1K 2D NEPA pretraining.
 
-Loads preprocessed .npy files (one per CT volume, shape [N_slices, 224, 224])
-and exposes them as individual 2D slices ready for ViT.
+UPDATED: now generates random patch masks (75% masked) to prevent
+representation collapse on visually-uniform CT slices.
 
 Output per sample:
-    pixel_values: torch.Tensor of shape (3, 224, 224), float32
-                  - 3-channel (grayscale replicated)
-                  - normalized with ImageNet mean/std
+    pixel_values:    (3, 224, 224) float32
+    bool_masked_pos: (256,) bool   - True = this patch is masked
 """
 
 import os
 import glob
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -21,40 +21,58 @@ from torchvision import transforms
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
+# NEPA masking config
+IMAGE_SIZE  = 224
+PATCH_SIZE  = 14
+NUM_PATCHES = (IMAGE_SIZE // PATCH_SIZE) ** 2   # 256
+MASK_RATIO  = 0.75
+
+
+def random_masking(num_patches, mask_ratio):
+    """Pick a random subset of patch positions to mask."""
+    num_masked = int(num_patches * mask_ratio)
+    indices = torch.randperm(num_patches)[:num_masked]
+    mask = torch.zeros(num_patches, dtype=torch.bool)
+    mask[indices] = True
+    return mask
+
 
 class AbdomenCTSliceDataset(Dataset):
     """
-    Each item is one 2D axial slice from a preprocessed volume.
-    All volumes share the same preprocessing (window, resize, etc.).
-
     Args:
         data_dir: folder containing .npy files (one per case)
-        train: if True, applies light augmentation (flip)
+        train:    if True, applies augmentation (flip) and random masking.
+                  if False, no augmentation, no masking (used for clean eval).
+        mask_ratio: fraction of patches to mask during training (default 0.75)
     """
 
-    def __init__(self, data_dir, train=True):
+    def __init__(self, data_dir, train=True, mask_ratio=MASK_RATIO):
         self.data_dir = data_dir
         self.train = train
+        self.mask_ratio = mask_ratio
 
-        # Build a flat index: list of (case_path, slice_index)
-        # This lets us treat the whole dataset as one big slice pool.
+        # Flat index: (case_path, slice_index)
         self.index = []
         npy_files = sorted(glob.glob(os.path.join(data_dir, "*.npy")))
 
+        if len(npy_files) == 0:
+            raise FileNotFoundError(
+                f"No .npy files found in {data_dir}. "
+                "Did you run preprocess_abdomenct.py first?"
+            )
+
         for path in npy_files:
-            # Memory-map to read shape without loading the whole volume
             volume = np.load(path, mmap_mode="r")
-            num_slices = volume.shape[0]
-            for slice_idx in range(num_slices):
+            for slice_idx in range(volume.shape[0]):
                 self.index.append((path, slice_idx))
 
-        print(f"AbdomenCTSliceDataset: {len(npy_files)} cases, {len(self.index)} slices")
+        print(
+            f"AbdomenCTSliceDataset: {len(npy_files)} cases, "
+            f"{len(self.index)} slices, train={train}, mask_ratio={mask_ratio}"
+        )
 
-        # Augmentations applied per-slice
         if train:
-            self.augment = transforms.Compose([
-                transforms.RandomHorizontalFlip(p=0.5),
-            ])
+            self.augment = transforms.RandomHorizontalFlip(p=0.5)
         else:
             self.augment = None
 
@@ -66,40 +84,36 @@ class AbdomenCTSliceDataset(Dataset):
     def __getitem__(self, idx):
         path, slice_idx = self.index[idx]
 
-        # Memory-mapped read: only loads this one slice, not the whole volume
         volume = np.load(path, mmap_mode="r")
-        slice_2d = np.array(volume[slice_idx], dtype=np.float32)  # (224, 224) in [0, 1]
+        slice_2d = np.array(volume[slice_idx], dtype=np.float32)
 
-        # Convert to 3-channel tensor (C, H, W)
-        slice_3ch = np.stack([slice_2d, slice_2d, slice_2d], axis=0)  # (3, 224, 224)
+        # 3-channel
+        slice_3ch = np.stack([slice_2d, slice_2d, slice_2d], axis=0)
         tensor = torch.from_numpy(slice_3ch)
 
-        # Augment (operates on tensor, expects (C, H, W))
         if self.augment is not None:
             tensor = self.augment(tensor)
 
-        # Normalize with ImageNet stats
         tensor = self.normalize(tensor)
 
-        return {"pixel_values": tensor}
+        # Generate per-slice random mask only during training
+        if self.train and self.mask_ratio > 0:
+            bool_masked_pos = random_masking(NUM_PATCHES, self.mask_ratio)
+        else:
+            bool_masked_pos = torch.zeros(NUM_PATCHES, dtype=torch.bool)
+
+        return {
+            "pixel_values": tensor,
+            "bool_masked_pos": bool_masked_pos,
+        }
 
 
-# Quick sanity check you can run after preprocessing
 if __name__ == "__main__":
     DATA_DIR = "/content/preprocessed_slices"
 
     ds = AbdomenCTSliceDataset(DATA_DIR, train=True)
     sample = ds[0]
 
-    print(f"Sample shape: {sample['pixel_values'].shape}")
-    print(f"Sample dtype: {sample['pixel_values'].dtype}")
-    print(f"Sample range: [{sample['pixel_values'].min():.3f}, "
-          f"{sample['pixel_values'].max():.3f}]")
-    print(f"Sample mean: {sample['pixel_values'].mean():.3f}")
-    print(f"Sample std:  {sample['pixel_values'].std():.3f}")
-
-    # Test a dataloader
-    from torch.utils.data import DataLoader
-    loader = DataLoader(ds, batch_size=8, shuffle=True, num_workers=2)
-    batch = next(iter(loader))
-    print(f"\nBatch shape: {batch['pixel_values'].shape}")
+    print(f"pixel_values shape: {sample['pixel_values'].shape}")
+    print(f"bool_masked_pos shape: {sample['bool_masked_pos'].shape}")
+    print(f"Masked positions: {sample['bool_masked_pos'].sum().item()}/256")
