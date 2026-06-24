@@ -1236,7 +1236,7 @@ class ViTNepaEmbeddings(nn.Module):
             patch_embeds_flat = self.patch_embeddings(flat, interpolate_pos_encoding=False)
             # patch_embeds_flat: (B*D, num_patches, hidden)
             num_patches = patch_embeds_flat.shape[1]
-            embeddings = patch_embeds_flat.view(B, D * num_patches, -1)
+            embeddings = patch_embeds_flat.reshape(B, D * num_patches, -1)
             batch_size = B
         else:
             # 4D path: original behavior (one image per sample)
