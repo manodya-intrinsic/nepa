@@ -1335,6 +1335,8 @@ def main():
     # =====================================================================
     if data_args.use_ct_dataset:
         logger.info(f"Loading slice-sequence CT dataset from {data_args.train_dir}")
+        # For SSL pretraining: combine train + val cases (no label leakage since SSL uses no labels).
+        # Test cases stay completely untouched.
         train_dataset = AbdomenCTSliceSequenceDataset(
             image_dir=data_args.train_dir,
             split_json=data_args.split_json,
@@ -1343,14 +1345,24 @@ def main():
             samples_per_case_per_epoch=data_args.samples_per_case_per_epoch,
             train=True,
         )
-        eval_dataset = AbdomenCTSliceSequenceDataset(
+        val_for_train = AbdomenCTSliceSequenceDataset(
             image_dir=data_args.train_dir,
             split_json=data_args.split_json,
             split="val",
             num_slices_per_sample=data_args.num_slices_per_sample,
-            samples_per_case_per_epoch=1,  # one fixed window per val case
-            train=False,
+            samples_per_case_per_epoch=data_args.samples_per_case_per_epoch,
+            train=True,
         )
+        # Combine train + val for SSL
+        from torch.utils.data import ConcatDataset
+        train_dataset = ConcatDataset([train_dataset, val_for_train])
+        logger.info(
+            f"SSL pretraining uses train+val combined: {len(train_dataset)} total samples per epoch"
+        )
+
+        # No separate eval dataset during pretraining — there's no meaningful "validation"
+        # for SSL anyway (val loss is a weak proxy). Real evaluation comes from segmentation.
+        eval_dataset = None
 
         if data_args.max_train_samples is not None:
             # Limit by truncating the cases list
