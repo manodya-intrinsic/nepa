@@ -621,16 +621,478 @@
 
 # if __name__ == "__main__":
 #     main()
+# """
+# Run 2D NEPA pretraining.
+
+# Supports two data modes:
+# 1. ImageFolder (default) - for natural images
+# 2. CT slice dataset (--use_ct_dataset True) - for AbdomenCT-1K preprocessed slices
+
+# The CT path uses AbdomenCTSliceDataset which provides:
+#   - pixel_values: (3, 224, 224)
+#   - bool_masked_pos: (256,) bool   <-- prevents NEPA collapse on uniform CT data
+# """
+
+# import logging
+# import os
+# import sys
+# from dataclasses import dataclass, field
+# from typing import Optional
+
+# import numpy as np
+# import torch
+# from datasets import load_dataset, load_from_disk
+# from PIL import Image
+# from torchvision.transforms import (
+#     CenterCrop,
+#     Compose,
+#     Lambda,
+#     Normalize,
+#     RandomHorizontalFlip,
+#     RandomResizedCrop,
+#     Resize,
+#     ToTensor,
+# )
+
+# import transformers
+# from transformers import (
+#     MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING,
+#     AutoImageProcessor,
+#     HfArgumentParser,
+#     TimmWrapperImageProcessor,
+#     Trainer,
+#     TrainingArguments,
+#     set_seed,
+# )
+# from transformers.trainer_utils import get_last_checkpoint
+# from transformers.trainer_pt_utils import get_parameter_names
+# from transformers.utils.versions import require_version
+
+# from models.vit_nepa import ViTNepaForPreTraining, ViTNepaConfig
+
+# # NEW IMPORT for CT dataset
+# from dataset_abdomenct import AbdomenCTSliceDataset
+
+
+# logger = logging.getLogger(__name__)
+
+# require_version("datasets>=2.14.0", "To fix: pip install -r requirements.txt")
+
+# MODEL_CONFIG_CLASSES = list(MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING.keys())
+# MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+
+
+# def pil_loader(path: str):
+#     with open(path, "rb") as f:
+#         im = Image.open(f)
+#         return im.convert("RGB")
+
+
+# class EnhancedTrainer(Trainer):
+#     """Trainer with embed_lr support and EMA model tracking."""
+
+#     def __init__(self, *args, embed_lr=None, ema_decay=0.9999, use_ema=True, **kwargs):
+#         super().__init__(*args, **kwargs)
+#         self.embed_lr = embed_lr
+#         self.ema_decay = ema_decay
+#         self.use_ema = use_ema
+#         self.ema_model = None
+
+#     def get_decay_parameter_names(self, model) -> list[str]:
+#         forbidden = [
+#             r"bias", r"layernorm", r"rmsnorm", r"layer_scale",
+#             r"(?:^|\.)norm(?:$|\.)", r"_norm(?:$|\.)",
+#         ]
+#         return get_parameter_names(model, [torch.nn.LayerNorm], forbidden)
+
+#     def create_optimizer(self):
+#         if self.optimizer is not None:
+#             return self.optimizer
+#         if self.embed_lr is None:
+#             return super().create_optimizer()
+
+#         decay_params = set(self.get_decay_parameter_names(self.model))
+#         embed_params = set(
+#             f"vit_nepa.embeddings.{n}"
+#             for n, _ in self.model.vit_nepa.embeddings.named_parameters()
+#         )
+
+#         wd = self.args.weight_decay
+#         base_lr = self.args.learning_rate
+
+#         groups = [
+#             {"params": [], "weight_decay": wd,  "lr": self.embed_lr},
+#             {"params": [], "weight_decay": 0.0, "lr": self.embed_lr},
+#             {"params": [], "weight_decay": wd,  "lr": base_lr},
+#             {"params": [], "weight_decay": 0.0, "lr": base_lr},
+#         ]
+
+#         for name, p in self.model.named_parameters():
+#             if not p.requires_grad:
+#                 continue
+#             is_decay = name in decay_params
+#             is_embed = name in embed_params
+
+#             if is_embed and is_decay:
+#                 groups[0]["params"].append(p)
+#             elif is_embed and not is_decay:
+#                 groups[1]["params"].append(p)
+#             elif (not is_embed) and is_decay:
+#                 groups[2]["params"].append(p)
+#             else:
+#                 groups[3]["params"].append(p)
+
+#         optimizer_grouped_parameters = [g for g in groups if g["params"]]
+#         optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args)
+#         self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+#         return self.optimizer
+
+#     def _init_ema_model(self):
+#         if self.ema_model is None:
+#             import copy
+#             self.ema_model = copy.deepcopy(self.model)
+#             self.ema_model.eval()
+#             self.ema_model = self.ema_model.float()
+#             for p in self.ema_model.parameters():
+#                 p.requires_grad_(False)
+
+#     def _update_ema(self):
+#         if not self.use_ema:
+#             return
+#         if self.ema_model is None:
+#             self._init_ema_model()
+#         with torch.no_grad():
+#             msd = self.model.state_dict()
+#             for k, v in self.ema_model.state_dict().items():
+#                 if k in msd:
+#                     model_param = msd[k].float()
+#                     v.mul_(self.ema_decay).add_(model_param, alpha=1.0 - self.ema_decay)
+
+#     def _maybe_log_save_evaluate(self, *args, **kwargs):
+#         if self.state.global_step > getattr(self, "_ema_global_step", 0):
+#             self._update_ema()
+#             self._ema_global_step = self.state.global_step
+#         super()._maybe_log_save_evaluate(*args, **kwargs)
+
+#     def save_model(self, output_dir=None, _internal_call=False):
+#         super().save_model(output_dir, _internal_call)
+#         output_dir = output_dir if output_dir is not None else self.args.output_dir
+#         if self.use_ema and self.ema_model is not None and self.args.should_save:
+#             ema_path = f"{output_dir}/pytorch_model_ema.bin"
+#             os.makedirs(os.path.dirname(ema_path), exist_ok=True)
+#             torch.save(self.ema_model.state_dict(), ema_path)
+#             self.log({"ema_model_saved": ema_path})
+
+
+# @dataclass
+# class DataTrainingArguments:
+#     dataset_name: Optional[str] = field(default=None)
+#     dataset_config_name: Optional[str] = field(default=None)
+#     train_dir: Optional[str] = field(default=None)
+#     validation_dir: Optional[str] = field(default=None)
+#     train_val_split: Optional[float] = field(default=0.15)
+#     max_train_samples: Optional[int] = field(default=None)
+#     max_eval_samples: Optional[int] = field(default=None)
+#     image_column_name: str = field(default="image")
+#     load_from_disk: bool = field(default=False)
+#     keep_in_memory: bool = field(default=False)
+
+#     # Switch to CT dataset mode
+#     use_ct_dataset: bool = field(
+#         default=False,
+#         metadata={"help": "Use AbdomenCTSliceDataset instead of imagefolder. "
+#                           "Requires train_dir to point to a folder of preprocessed .npy files."},
+#     )
+
+#     def __post_init__(self):
+#         if self.use_ct_dataset:
+#             if self.train_dir is None:
+#                 raise ValueError("--use_ct_dataset requires --train_dir pointing to preprocessed .npy folder.")
+#         else:
+#             if self.dataset_name is None and (self.train_dir is None and self.validation_dir is None):
+#                 raise ValueError(
+#                     "You must specify either a dataset name from the hub or a train/validation directory."
+#                 )
+
+
+# @dataclass
+# class ModelArguments:
+#     model_name_or_path: str = field(default=None)
+#     model_type: Optional[str] = field(default=None)
+#     config_name: Optional[str] = field(default=None)
+#     cache_dir: Optional[str] = field(default=None)
+#     model_revision: str = field(default="main")
+#     image_processor_name: str = field(default=None)
+#     token: str = field(default=None)
+#     trust_remote_code: bool = field(default=False)
+#     ignore_mismatched_sizes: bool = field(default=False)
+#     embed_lr: Optional[float] = field(default=None)
+
+
+# def main():
+#     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
+#     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
+#         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+#     else:
+#         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+#     logging.basicConfig(
+#         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+#         datefmt="%m/%d/%Y %H:%M:%S",
+#         handlers=[logging.StreamHandler(sys.stdout)],
+#     )
+
+#     if training_args.should_log:
+#         transformers.utils.logging.set_verbosity_info()
+
+#     log_level = training_args.get_process_log_level()
+#     logger.setLevel(log_level)
+#     transformers.utils.logging.set_verbosity(log_level)
+#     transformers.utils.logging.enable_default_handler()
+#     transformers.utils.logging.enable_explicit_format()
+
+#     logger.warning(
+#         f"Process rank: {training_args.local_rank}, device: {training_args.device}, "
+#         f"n_gpu: {training_args.n_gpu}, "
+#         f"distributed: {training_args.parallel_mode.value == 'distributed'}, fp16: {training_args.fp16}"
+#     )
+
+#     last_checkpoint = None
+#     if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
+#         last_checkpoint = get_last_checkpoint(training_args.output_dir)
+#         if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
+#             raise ValueError(
+#                 f"Output directory ({training_args.output_dir}) already exists and is not empty. "
+#                 "Use --overwrite_output_dir to overcome."
+#             )
+
+#     set_seed(training_args.seed)
+
+#     # =====================================================================
+#     # DATA LOADING - branches based on --use_ct_dataset
+#     # =====================================================================
+#     if data_args.use_ct_dataset:
+#         logger.info(f"Loading CT slice dataset from {data_args.train_dir}")
+#         train_dataset = AbdomenCTSliceDataset(data_args.train_dir, train=True)
+#         eval_dataset = None
+#         if data_args.validation_dir is not None:
+#             eval_dataset = AbdomenCTSliceDataset(data_args.validation_dir, train=False)
+
+#         if data_args.max_train_samples is not None:
+#             train_dataset.index = train_dataset.index[: data_args.max_train_samples]
+#             logger.info(f"Truncated train dataset to {len(train_dataset)} slices")
+
+#         # CT collator: pass bool_masked_pos through to the model
+#         def collate_fn(examples):
+#             pixel_values = torch.stack([ex["pixel_values"] for ex in examples])
+#             batch = {"pixel_values": pixel_values}
+#             if "bool_masked_pos" in examples[0]:
+#                 batch["bool_masked_pos"] = torch.stack([ex["bool_masked_pos"] for ex in examples])
+#             return batch
+
+#         image_processor = None
+
+#     else:
+#         # ----- Original imagefolder mode -----
+#         if data_args.dataset_name is not None:
+#             if data_args.load_from_disk:
+#                 dataset = load_from_disk(data_args.dataset_name, keep_in_memory=data_args.keep_in_memory)
+#             else:
+#                 dataset = load_dataset(
+#                     data_args.dataset_name,
+#                     data_args.dataset_config_name,
+#                     cache_dir=model_args.cache_dir,
+#                     token=model_args.token,
+#                     trust_remote_code=model_args.trust_remote_code,
+#                 )
+#         else:
+#             data_files = {}
+#             if data_args.train_dir is not None:
+#                 data_files["train"] = os.path.join(data_args.train_dir, "**")
+#             if data_args.validation_dir is not None:
+#                 data_files["validation"] = os.path.join(data_args.validation_dir, "**")
+#             dataset = load_dataset("imagefolder", data_files=data_files, cache_dir=model_args.cache_dir)
+
+#         dataset_column_names = (
+#             dataset["train"].column_names if "train" in dataset else dataset["validation"].column_names
+#         )
+#         if data_args.image_column_name not in dataset_column_names:
+#             raise ValueError(
+#                 f"--image_column_name {data_args.image_column_name} not found in dataset."
+#             )
+
+#         def collate_fn(examples):
+#             pixel_values = torch.stack([example["pixel_values"] for example in examples])
+#             return {"pixel_values": pixel_values}
+
+#         data_args.train_val_split = None if "validation" in dataset else data_args.train_val_split
+#         if isinstance(data_args.train_val_split, float) and data_args.train_val_split > 0.0:
+#             split = dataset["train"].train_test_split(data_args.train_val_split)
+#             dataset["train"] = split["train"]
+#             dataset["validation"] = split["test"]
+
+#     # =====================================================================
+#     # MODEL
+#     # =====================================================================
+#     config = ViTNepaConfig.from_pretrained(
+#         model_args.config_name or model_args.model_name_or_path,
+#         cache_dir=model_args.cache_dir,
+#         revision=model_args.model_revision,
+#         token=model_args.token,
+#         trust_remote_code=model_args.trust_remote_code,
+#     )
+
+#     if model_args.model_name_or_path:
+#         model = ViTNepaForPreTraining.from_pretrained(
+#             model_args.model_name_or_path,
+#             from_tf=bool(".ckpt" in model_args.model_name_or_path),
+#             config=config,
+#             cache_dir=model_args.cache_dir,
+#             revision=model_args.model_revision,
+#             token=model_args.token,
+#             trust_remote_code=model_args.trust_remote_code,
+#             ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
+#         )
+#     else:
+#         logger.info("Training new model from scratch")
+#         model = ViTNepaForPreTraining(config)
+
+#     # In CT mode, ViTNepaModel needs use_mask_token=True so masked positions
+#     # get replaced with the learnable mask token instead of being passed through.
+#     if data_args.use_ct_dataset:
+#         old_state = model.vit_nepa.state_dict()
+#         model.vit_nepa = model.vit_nepa.__class__(config, use_mask_token=True)
+#         model.vit_nepa.load_state_dict(old_state, strict=False)
+#         logger.info("CT mode: enabled mask_token in encoder")
+
+#     # =====================================================================
+#     # IMAGE PROCESSOR + TRANSFORMS (only for imagefolder mode)
+#     # =====================================================================
+#     if not data_args.use_ct_dataset:
+#         image_processor = AutoImageProcessor.from_pretrained(
+#             model_args.image_processor_name or model_args.model_name_or_path,
+#             cache_dir=model_args.cache_dir,
+#             revision=model_args.model_revision,
+#             token=model_args.token,
+#             trust_remote_code=model_args.trust_remote_code,
+#             use_fast=True,
+#         )
+
+#         if isinstance(image_processor, TimmWrapperImageProcessor):
+#             _train_transforms = Compose([
+#                 RandomResizedCrop(image_processor.input_size, interpolation=3),
+#                 RandomHorizontalFlip(),
+#                 ToTensor(),
+#                 Normalize(mean=image_processor.mean, std=image_processor.std),
+#             ])
+#             _val_transforms = Compose([
+#                 Resize(image_processor.input_size, interpolation=3),
+#                 CenterCrop(image_processor.input_size),
+#                 ToTensor(),
+#                 Normalize(mean=image_processor.mean, std=image_processor.std),
+#             ])
+#         else:
+#             if "shortest_edge" in image_processor.size:
+#                 size = image_processor.size["shortest_edge"]
+#             else:
+#                 size = (image_processor.size["height"], image_processor.size["width"])
+
+#             if hasattr(image_processor, "image_mean") and hasattr(image_processor, "image_std"):
+#                 normalize = Normalize(mean=image_processor.image_mean, std=image_processor.image_std)
+#             else:
+#                 normalize = Lambda(lambda x: x)
+
+#             _train_transforms = Compose([
+#                 RandomResizedCrop(size), RandomHorizontalFlip(), ToTensor(), normalize,
+#             ])
+#             _val_transforms = Compose([
+#                 Resize(size), CenterCrop(size), ToTensor(), normalize,
+#             ])
+
+#         def train_transforms(example_batch):
+#             example_batch["pixel_values"] = [
+#                 _train_transforms(pil_img.convert("RGB"))
+#                 for pil_img in example_batch[data_args.image_column_name]
+#             ]
+#             return example_batch
+
+#         def val_transforms(example_batch):
+#             example_batch["pixel_values"] = [
+#                 _val_transforms(pil_img.convert("RGB"))
+#                 for pil_img in example_batch[data_args.image_column_name]
+#             ]
+#             return example_batch
+
+#         if training_args.do_train:
+#             if "train" not in dataset:
+#                 raise ValueError("--do_train requires a train dataset")
+#             if data_args.max_train_samples is not None:
+#                 dataset["train"] = (
+#                     dataset["train"].shuffle(seed=training_args.seed)
+#                     .select(range(data_args.max_train_samples))
+#                 )
+#             dataset["train"].set_transform(train_transforms)
+
+#         if training_args.do_eval:
+#             if "validation" not in dataset:
+#                 raise ValueError("--do_eval requires a validation dataset")
+#             if data_args.max_eval_samples is not None:
+#                 dataset["validation"] = (
+#                     dataset["validation"].shuffle(seed=training_args.seed)
+#                     .select(range(data_args.max_eval_samples))
+#                 )
+#             dataset["validation"].set_transform(val_transforms)
+
+#         train_dataset = dataset["train"] if training_args.do_train else None
+#         eval_dataset = dataset["validation"] if training_args.do_eval else None
+
+#     # =====================================================================
+#     # TRAINER
+#     # =====================================================================
+#     trainer = EnhancedTrainer(
+#         model=model,
+#         args=training_args,
+#         train_dataset=train_dataset,
+#         eval_dataset=eval_dataset,
+#         processing_class=image_processor,
+#         data_collator=collate_fn,
+#         embed_lr=model_args.embed_lr,
+#     )
+
+#     if training_args.do_train:
+#         checkpoint = training_args.resume_from_checkpoint or last_checkpoint
+#         train_result = trainer.train(resume_from_checkpoint=checkpoint)
+#         trainer.save_model()
+#         trainer.log_metrics("train", train_result.metrics)
+#         trainer.save_metrics("train", train_result.metrics)
+#         trainer.save_state()
+
+#     kwargs = {
+#         "finetuned_from": model_args.model_name_or_path,
+#         "tasks": "embedded-prediction",
+#         "dataset": data_args.dataset_name or data_args.train_dir,
+#         "tags": ["embedded-prediction", "vision"],
+#     }
+#     if training_args.push_to_hub:
+#         trainer.push_to_hub(**kwargs)
+#     else:
+#         trainer.create_model_card(**kwargs)
+
+
+# def _mp_fn(index):
+#     main()
+
+
+# if __name__ == "__main__":
+#     main()
+# Licensed under the Apache License, Version 2.0 (the "License");
+# (license unchanged)
 """
-Run 2D NEPA pretraining.
+Run slice-sequence NEPA pretraining on AbdomenCT-1K.
 
-Supports two data modes:
-1. ImageFolder (default) - for natural images
-2. CT slice dataset (--use_ct_dataset True) - for AbdomenCT-1K preprocessed slices
-
-The CT path uses AbdomenCTSliceDataset which provides:
-  - pixel_values: (3, 224, 224)
-  - bool_masked_pos: (256,) bool   <-- prevents NEPA collapse on uniform CT data
+Reads case-level split from data_split.json (created earlier).
+Reads preprocessed slices (z-resampled) from --train_dir.
+Each sample is a stack of --num_slices_per_sample consecutive slices.
 """
 
 import logging
@@ -644,14 +1106,8 @@ import torch
 from datasets import load_dataset, load_from_disk
 from PIL import Image
 from torchvision.transforms import (
-    CenterCrop,
-    Compose,
-    Lambda,
-    Normalize,
-    RandomHorizontalFlip,
-    RandomResizedCrop,
-    Resize,
-    ToTensor,
+    CenterCrop, Compose, Lambda, Normalize,
+    RandomHorizontalFlip, RandomResizedCrop, Resize, ToTensor,
 )
 
 import transformers
@@ -670,8 +1126,8 @@ from transformers.utils.versions import require_version
 
 from models.vit_nepa import ViTNepaForPreTraining, ViTNepaConfig
 
-# NEW IMPORT for CT dataset
-from dataset_abdomenct import AbdomenCTSliceDataset
+# NEW: slice-sequence dataset
+from dataset_abdomenct import AbdomenCTSliceSequenceDataset
 
 
 logger = logging.getLogger(__name__)
@@ -796,23 +1252,31 @@ class DataTrainingArguments:
     image_column_name: str = field(default="image")
     load_from_disk: bool = field(default=False)
     keep_in_memory: bool = field(default=False)
+    use_ct_dataset: bool = field(default=False)
 
-    # Switch to CT dataset mode
-    use_ct_dataset: bool = field(
-        default=False,
-        metadata={"help": "Use AbdomenCTSliceDataset instead of imagefolder. "
-                          "Requires train_dir to point to a folder of preprocessed .npy files."},
+    # NEW: slice-sequence args
+    split_json: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to data_split.json with train/val/test case IDs."}
+    )
+    num_slices_per_sample: int = field(
+        default=8,
+        metadata={"help": "How many consecutive slices per training sample."}
+    )
+    samples_per_case_per_epoch: int = field(
+        default=4,
+        metadata={"help": "How many random N-slice windows to draw per case per epoch."}
     )
 
     def __post_init__(self):
         if self.use_ct_dataset:
             if self.train_dir is None:
-                raise ValueError("--use_ct_dataset requires --train_dir pointing to preprocessed .npy folder.")
+                raise ValueError("--use_ct_dataset requires --train_dir.")
+            if self.split_json is None:
+                raise ValueError("--use_ct_dataset requires --split_json.")
         else:
             if self.dataset_name is None and (self.train_dir is None and self.validation_dir is None):
-                raise ValueError(
-                    "You must specify either a dataset name from the hub or a train/validation directory."
-                )
+                raise ValueError("Need dataset_name or train/validation directory.")
 
 
 @dataclass
@@ -844,7 +1308,6 @@ def main():
 
     if training_args.should_log:
         transformers.utils.logging.set_verbosity_info()
-
     log_level = training_args.get_process_log_level()
     logger.setLevel(log_level)
     transformers.utils.logging.set_verbosity(log_level)
@@ -862,47 +1325,52 @@ def main():
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
         if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
             raise ValueError(
-                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
-                "Use --overwrite_output_dir to overcome."
+                f"Output dir not empty: {training_args.output_dir}. Use --overwrite_output_dir."
             )
 
     set_seed(training_args.seed)
 
     # =====================================================================
-    # DATA LOADING - branches based on --use_ct_dataset
+    # DATA LOADING
     # =====================================================================
     if data_args.use_ct_dataset:
-        logger.info(f"Loading CT slice dataset from {data_args.train_dir}")
-        train_dataset = AbdomenCTSliceDataset(data_args.train_dir, train=True)
-        eval_dataset = None
-        if data_args.validation_dir is not None:
-            eval_dataset = AbdomenCTSliceDataset(data_args.validation_dir, train=False)
+        logger.info(f"Loading slice-sequence CT dataset from {data_args.train_dir}")
+        train_dataset = AbdomenCTSliceSequenceDataset(
+            image_dir=data_args.train_dir,
+            split_json=data_args.split_json,
+            split="train",
+            num_slices_per_sample=data_args.num_slices_per_sample,
+            samples_per_case_per_epoch=data_args.samples_per_case_per_epoch,
+            train=True,
+        )
+        eval_dataset = AbdomenCTSliceSequenceDataset(
+            image_dir=data_args.train_dir,
+            split_json=data_args.split_json,
+            split="val",
+            num_slices_per_sample=data_args.num_slices_per_sample,
+            samples_per_case_per_epoch=1,  # one fixed window per val case
+            train=False,
+        )
 
         if data_args.max_train_samples is not None:
-            train_dataset.index = train_dataset.index[: data_args.max_train_samples]
-            logger.info(f"Truncated train dataset to {len(train_dataset)} slices")
+            # Limit by truncating the cases list
+            train_dataset.cases = train_dataset.cases[: data_args.max_train_samples]
 
-        # CT collator: pass bool_masked_pos through to the model
         def collate_fn(examples):
             pixel_values = torch.stack([ex["pixel_values"] for ex in examples])
-            batch = {"pixel_values": pixel_values}
-            if "bool_masked_pos" in examples[0]:
-                batch["bool_masked_pos"] = torch.stack([ex["bool_masked_pos"] for ex in examples])
-            return batch
+            return {"pixel_values": pixel_values}
 
         image_processor = None
 
     else:
-        # ----- Original imagefolder mode -----
+        # ----- Original imagefolder mode (kept for backward compat) -----
         if data_args.dataset_name is not None:
             if data_args.load_from_disk:
                 dataset = load_from_disk(data_args.dataset_name, keep_in_memory=data_args.keep_in_memory)
             else:
                 dataset = load_dataset(
-                    data_args.dataset_name,
-                    data_args.dataset_config_name,
-                    cache_dir=model_args.cache_dir,
-                    token=model_args.token,
+                    data_args.dataset_name, data_args.dataset_config_name,
+                    cache_dir=model_args.cache_dir, token=model_args.token,
                     trust_remote_code=model_args.trust_remote_code,
                 )
         else:
@@ -913,23 +1381,13 @@ def main():
                 data_files["validation"] = os.path.join(data_args.validation_dir, "**")
             dataset = load_dataset("imagefolder", data_files=data_files, cache_dir=model_args.cache_dir)
 
-        dataset_column_names = (
-            dataset["train"].column_names if "train" in dataset else dataset["validation"].column_names
-        )
-        if data_args.image_column_name not in dataset_column_names:
-            raise ValueError(
-                f"--image_column_name {data_args.image_column_name} not found in dataset."
-            )
-
         def collate_fn(examples):
             pixel_values = torch.stack([example["pixel_values"] for example in examples])
             return {"pixel_values": pixel_values}
 
-        data_args.train_val_split = None if "validation" in dataset else data_args.train_val_split
-        if isinstance(data_args.train_val_split, float) and data_args.train_val_split > 0.0:
-            split = dataset["train"].train_test_split(data_args.train_val_split)
-            dataset["train"] = split["train"]
-            dataset["validation"] = split["test"]
+        train_dataset = dataset.get("train")
+        eval_dataset = dataset.get("validation")
+        image_processor = None
 
     # =====================================================================
     # MODEL
@@ -956,95 +1414,6 @@ def main():
     else:
         logger.info("Training new model from scratch")
         model = ViTNepaForPreTraining(config)
-
-    # In CT mode, ViTNepaModel needs use_mask_token=True so masked positions
-    # get replaced with the learnable mask token instead of being passed through.
-    if data_args.use_ct_dataset:
-        old_state = model.vit_nepa.state_dict()
-        model.vit_nepa = model.vit_nepa.__class__(config, use_mask_token=True)
-        model.vit_nepa.load_state_dict(old_state, strict=False)
-        logger.info("CT mode: enabled mask_token in encoder")
-
-    # =====================================================================
-    # IMAGE PROCESSOR + TRANSFORMS (only for imagefolder mode)
-    # =====================================================================
-    if not data_args.use_ct_dataset:
-        image_processor = AutoImageProcessor.from_pretrained(
-            model_args.image_processor_name or model_args.model_name_or_path,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            token=model_args.token,
-            trust_remote_code=model_args.trust_remote_code,
-            use_fast=True,
-        )
-
-        if isinstance(image_processor, TimmWrapperImageProcessor):
-            _train_transforms = Compose([
-                RandomResizedCrop(image_processor.input_size, interpolation=3),
-                RandomHorizontalFlip(),
-                ToTensor(),
-                Normalize(mean=image_processor.mean, std=image_processor.std),
-            ])
-            _val_transforms = Compose([
-                Resize(image_processor.input_size, interpolation=3),
-                CenterCrop(image_processor.input_size),
-                ToTensor(),
-                Normalize(mean=image_processor.mean, std=image_processor.std),
-            ])
-        else:
-            if "shortest_edge" in image_processor.size:
-                size = image_processor.size["shortest_edge"]
-            else:
-                size = (image_processor.size["height"], image_processor.size["width"])
-
-            if hasattr(image_processor, "image_mean") and hasattr(image_processor, "image_std"):
-                normalize = Normalize(mean=image_processor.image_mean, std=image_processor.image_std)
-            else:
-                normalize = Lambda(lambda x: x)
-
-            _train_transforms = Compose([
-                RandomResizedCrop(size), RandomHorizontalFlip(), ToTensor(), normalize,
-            ])
-            _val_transforms = Compose([
-                Resize(size), CenterCrop(size), ToTensor(), normalize,
-            ])
-
-        def train_transforms(example_batch):
-            example_batch["pixel_values"] = [
-                _train_transforms(pil_img.convert("RGB"))
-                for pil_img in example_batch[data_args.image_column_name]
-            ]
-            return example_batch
-
-        def val_transforms(example_batch):
-            example_batch["pixel_values"] = [
-                _val_transforms(pil_img.convert("RGB"))
-                for pil_img in example_batch[data_args.image_column_name]
-            ]
-            return example_batch
-
-        if training_args.do_train:
-            if "train" not in dataset:
-                raise ValueError("--do_train requires a train dataset")
-            if data_args.max_train_samples is not None:
-                dataset["train"] = (
-                    dataset["train"].shuffle(seed=training_args.seed)
-                    .select(range(data_args.max_train_samples))
-                )
-            dataset["train"].set_transform(train_transforms)
-
-        if training_args.do_eval:
-            if "validation" not in dataset:
-                raise ValueError("--do_eval requires a validation dataset")
-            if data_args.max_eval_samples is not None:
-                dataset["validation"] = (
-                    dataset["validation"].shuffle(seed=training_args.seed)
-                    .select(range(data_args.max_eval_samples))
-                )
-            dataset["validation"].set_transform(val_transforms)
-
-        train_dataset = dataset["train"] if training_args.do_train else None
-        eval_dataset = dataset["validation"] if training_args.do_eval else None
 
     # =====================================================================
     # TRAINER
