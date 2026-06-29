@@ -955,13 +955,17 @@
 # __all__ = ["ViTNepaForImageClassification", "ViTNepaForPreTraining", "ViTNepaModel", "ViTNepaPreTrainedModel"]
 # Licensed under the Apache License, Version 2.0 (the "License");
 # (...license unchanged...)
-"""PyTorch ViTNepa model.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# (license unchanged)
+"""PyTorch ViTNepa model with 3D RoPE for slice-sequence NEPA.
 
 Supports BOTH 2D (B, C, H, W) and 5D (B, C, D, H, W) inputs.
-For 5D inputs, each slice is patch-embedded independently and concatenated
-into one long sequence per batch sample. 2D RoPE is tiled per slice so each
-slice's patches get the correct (y, x) positional encoding. Slice-to-slice
-information flows through causal attention + sequence position.
+For 5D inputs:
+  - Each slice is patch-embedded independently and concatenated into one sequence
+  - 3D RoPE encodes each patch's (z, y, x) position with a non-uniform channel split:
+        z=20 channels, y=22 channels, x=22 channels (total=64=head_dim)
+  - Patches in different slices get distinct positional encodings, so the model
+    distinguishes slices via RoPE (not just sequence position + causal mask)
 """
 
 import collections.abc
@@ -994,29 +998,15 @@ logger = logging.get_logger(__name__)
 
 
 def prediction_loss(h_in, h_out, shift: bool = True):
-    """Similarity loss between two hidden states.
-
-    Args:
-        h_in:  [B, T, D]  input hidden states (target — detached)
-        h_out: [B, T, D]  output hidden states (prediction)
-        shift: if True, compare h_out[:, :-1] with h_in[:, 1:]
-               else, compare h_out with h_in (position-wise)
-
-    Returns:
-        scalar loss (negative cosine similarity averaged over all positions)
-    """
     h_in = h_in.detach()
-
     if shift:
         p = h_out[:, :-1, :]
         z = h_in[:, 1:, :]
     else:
         p = h_out
         z = h_in
-
     p = F.normalize(p, dim=-1)
     z = F.normalize(z, dim=-1)
-
     loss = -(p * z).sum(dim=-1).mean()
     return loss
 
@@ -1024,11 +1014,31 @@ def prediction_loss(h_in, h_out, shift: bool = True):
 def get_patches_center_coordinates(
     num_patches_h: int, num_patches_w: int, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
-    """2D patch center coordinates, normalized to [-1, +1]."""
+    """2D patch center coordinates, normalized to [-1, +1]. Used in 4D (one image) mode."""
     coords_h = torch.arange(0.5, num_patches_h, dtype=dtype, device=device) / num_patches_h
     coords_w = torch.arange(0.5, num_patches_w, dtype=dtype, device=device) / num_patches_w
     coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"), dim=-1)
     coords = coords.flatten(0, 1)
+    coords = 2.0 * coords - 1.0
+    return coords
+
+
+def get_patches_center_coordinates_3d(
+    num_slices: int, num_patches_h: int, num_patches_w: int,
+    dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """3D patch center coordinates (z, y, x), normalized to [-1, +1]. Used in 5D mode.
+
+    Order follows the flatten order: (Z, H, W) -> (Z*H*W, 3), z slowest, x fastest.
+    """
+    coords_z = torch.arange(0.5, num_slices, dtype=dtype, device=device) / num_slices
+    coords_h = torch.arange(0.5, num_patches_h, dtype=dtype, device=device) / num_patches_h
+    coords_w = torch.arange(0.5, num_patches_w, dtype=dtype, device=device) / num_patches_w
+    grid = torch.stack(
+        torch.meshgrid(coords_z, coords_h, coords_w, indexing="ij"),
+        dim=-1
+    )
+    coords = grid.flatten(0, 2)
     coords = 2.0 * coords - 1.0
     return coords
 
@@ -1039,55 +1049,84 @@ def augment_patches_center_coordinates(
     jitter: Optional[float] = None,
     rescale: Optional[float] = None,
 ) -> torch.Tensor:
+    """Coordinate augmentation. Works for 2D and 3D coords (last dim = 2 or 3)."""
+    n_dims = coords.shape[-1]
     if shift is not None:
-        shift_hw = torch.empty((1, 2), device=coords.device, dtype=coords.dtype)
-        shift_hw = shift_hw.uniform_(-shift, shift)
-        coords = coords + shift_hw
+        shift_vec = torch.empty((1, n_dims), device=coords.device, dtype=coords.dtype)
+        shift_vec = shift_vec.uniform_(-shift, shift)
+        coords = coords + shift_vec
     if jitter is not None:
         jitter_range = np.log(jitter)
-        jitter_hw = torch.empty((1, 2), device=coords.device, dtype=coords.dtype)
-        jitter_hw = jitter_hw.uniform_(-jitter_range, jitter_range).exp()
-        coords = coords * jitter_hw
+        jitter_vec = torch.empty((1, n_dims), device=coords.device, dtype=coords.dtype)
+        jitter_vec = jitter_vec.uniform_(-jitter_range, jitter_range).exp()
+        coords = coords * jitter_vec
     if rescale is not None:
         rescale_range = np.log(rescale)
-        rescale_hw = torch.empty(1, device=coords.device, dtype=coords.dtype)
-        rescale_hw = rescale_hw.uniform_(-rescale_range, rescale_range).exp()
-        coords = coords * rescale_hw
+        rescale_scalar = torch.empty(1, device=coords.device, dtype=coords.dtype)
+        rescale_scalar = rescale_scalar.uniform_(-rescale_range, rescale_range).exp()
+        coords = coords * rescale_scalar
     return coords
 
 
 class ViTNepaRopePositionEmbedding(nn.Module):
-    """2D RoPE positional embedding.
+    """RoPE positional embedding. Auto-switches between 2D and 3D modes.
 
-    For 4D input (one image): produces (cos, sin) for num_patches positions.
-    For 5D input (slice stack): produces (cos, sin) for num_patches positions,
-        then TILES them D times so each slice gets the same (y, x) pattern.
-        Slices are distinguished by sequence position + causal attention.
+    4D input (one image, B,C,H,W):
+        Standard 2D RoPE. head_dim split into 2 halves (y, x), each head_dim/2 channels.
+
+    5D input (slice stack, B,C,D,H,W):
+        3D RoPE. head_dim=64 split NON-UNIFORMLY:
+            z gets 20 channels (10 RoPE pairs)
+            y gets 22 channels (11 RoPE pairs)
+            x gets 22 channels (11 RoPE pairs)
     """
 
-    inv_freq: torch.Tensor
+    inv_freq_2d: torch.Tensor
+    inv_freq_3d_z: torch.Tensor
+    inv_freq_3d_h: torch.Tensor
+    inv_freq_3d_w: torch.Tensor
 
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.base = config.rope_theta
-        self.head_dim = config.hidden_size // config.num_attention_heads
-        self.num_patches_h = config.image_size // config.patch_size
-        self.num_patches_w = config.image_size // config.patch_size
+        self.head_dim = config.hidden_size // config.num_attention_heads   # 64 for ViT-B
 
-        inv_freq = 1 / self.base ** torch.arange(0, 1, 4 / self.head_dim, dtype=torch.float32)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        # 3D RoPE channel split (must sum to head_dim, each must be EVEN)
+        # 20 + 22 + 22 = 64 ✓
+        self.z_channels = 20
+        self.h_channels = 22
+        self.w_channels = 22
+        assert self.z_channels + self.h_channels + self.w_channels == self.head_dim, \
+            f"channel split {self.z_channels}+{self.h_channels}+{self.w_channels} must equal head_dim={self.head_dim}"
+        assert self.z_channels % 2 == 0 and self.h_channels % 2 == 0 and self.w_channels % 2 == 0, \
+            "each axis channel count must be even for cos/sin pairing"
 
-    def forward(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # Detect mode by rank
-        is_3d = (pixel_values.dim() == 5)
+        # ---- 2D inverse frequencies (unchanged, for 4D / image mode) ----
+        inv_freq_2d = 1 / self.base ** torch.arange(
+            0, 1, 4 / self.head_dim, dtype=torch.float32
+        )
+        self.register_buffer("inv_freq_2d", inv_freq_2d, persistent=False)
 
-        if is_3d:
-            _, _, num_slices, height, width = pixel_values.shape
-        else:
-            _, _, height, width = pixel_values.shape
-            num_slices = 1
+        # ---- 3D inverse frequencies (one per axis, non-uniform sizes) ----
+        # For axis with C channels: C/2 frequency pairs, f_k = base^(-2k/C)
+        inv_freq_3d_z = 1.0 / (self.base ** (
+            torch.arange(0, self.z_channels, 2, dtype=torch.float32) / self.z_channels
+        ))   # (10,)
+        inv_freq_3d_h = 1.0 / (self.base ** (
+            torch.arange(0, self.h_channels, 2, dtype=torch.float32) / self.h_channels
+        ))   # (11,)
+        inv_freq_3d_w = 1.0 / (self.base ** (
+            torch.arange(0, self.w_channels, 2, dtype=torch.float32) / self.w_channels
+        ))   # (11,)
 
+        self.register_buffer("inv_freq_3d_z", inv_freq_3d_z, persistent=False)
+        self.register_buffer("inv_freq_3d_h", inv_freq_3d_h, persistent=False)
+        self.register_buffer("inv_freq_3d_w", inv_freq_3d_w, persistent=False)
+
+    def _forward_2d(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Original 2D RoPE path. Used for 4D inputs (one image per sample)."""
+        _, _, height, width = pixel_values.shape
         num_patches_h = height // self.config.patch_size
         num_patches_w = width // self.config.patch_size
 
@@ -1106,28 +1145,78 @@ class ViTNepaRopePositionEmbedding(nn.Module):
                     rescale=self.config.pos_embed_rescale,
                 )
 
-            # 2D RoPE on (h, w) — same logic as the original code
-            angles = 2 * math.pi * patch_coords[:, :, None] * self.inv_freq[None, None, :]
+            angles = 2 * math.pi * patch_coords[:, :, None] * self.inv_freq_2d[None, None, :]
             angles = angles.flatten(1, 2)
-            angles = angles.tile(2)   # (num_patches, head_dim)
+            angles = angles.tile(2)
 
             cos = torch.cos(angles)
             sin = torch.sin(angles)
 
-            if is_3d:
-                # TILE the 2D RoPE pattern D times — once per slice in the stack.
-                # Each slice's patches get the same (h, w) positional encoding;
-                # slice ordering is captured by sequence position + causal mask.
-                # Shape after tile: (num_slices * num_patches, head_dim)
-                cos = cos.repeat(num_slices, 1)
-                sin = sin.repeat(num_slices, 1)
+        dtype = pixel_values.dtype
+        return cos.to(dtype=dtype), sin.to(dtype=dtype)
+
+    def _forward_3d(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """3D RoPE path for slice sequences (B, C, D, H, W).
+
+        Returns cos, sin tensors of shape (D*num_patches, head_dim).
+        Channel allocation:
+            channels [0  : 20] rotated by z position    (10 freq pairs)
+            channels [20 : 42] rotated by y position    (11 freq pairs)
+            channels [42 : 64] rotated by x position    (11 freq pairs)
+        """
+        _, _, num_slices, height, width = pixel_values.shape
+        num_patches_h = height // self.config.patch_size
+        num_patches_w = width // self.config.patch_size
+
+        device = pixel_values.device
+        device_type = device.type if isinstance(device.type, str) and device.type != "mps" else "cpu"
+
+        with torch.autocast(device_type=device_type, enabled=False):
+            patch_coords = get_patches_center_coordinates_3d(
+                num_slices, num_patches_h, num_patches_w,
+                dtype=torch.float32, device=device
+            )
+            if self.training:
+                patch_coords = augment_patches_center_coordinates(
+                    patch_coords,
+                    shift=self.config.pos_embed_shift,
+                    jitter=self.config.pos_embed_jitter,
+                    rescale=self.config.pos_embed_rescale,
+                )
+
+            # angles_z: (T, 10), angles_h: (T, 11), angles_w: (T, 11)
+            angles_z = 2 * math.pi * patch_coords[:, 0:1] * self.inv_freq_3d_z[None, :]
+            angles_h = 2 * math.pi * patch_coords[:, 1:2] * self.inv_freq_3d_h[None, :]
+            angles_w = 2 * math.pi * patch_coords[:, 2:3] * self.inv_freq_3d_w[None, :]
+
+            # Tile each to fill its full channel allocation
+            # (T, 10) -> (T, 20); (T, 11) -> (T, 22); (T, 11) -> (T, 22)
+            angles_z = angles_z.tile(2)
+            angles_h = angles_h.tile(2)
+            angles_w = angles_w.tile(2)
+
+            # Concatenate along channel dim -> (T, 64)
+            angles = torch.cat([angles_z, angles_h, angles_w], dim=-1)
+
+            cos = torch.cos(angles)
+            sin = torch.sin(angles)
 
         dtype = pixel_values.dtype
         return cos.to(dtype=dtype), sin.to(dtype=dtype)
 
+    def forward(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if pixel_values.dim() == 4:
+            return self._forward_2d(pixel_values)
+        elif pixel_values.dim() == 5:
+            return self._forward_3d(pixel_values)
+        else:
+            raise ValueError(
+                f"pixel_values must be 4D (image) or 5D (slice sequence), "
+                f"got shape {tuple(pixel_values.shape)}"
+            )
+
 
 def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
@@ -1135,7 +1224,8 @@ def rotate_half(x):
 
 @dataclass
 class BaseModelOutputWithEmbedding(ModelOutput):
-    """    Base class for model outputs that include the last hidden states and input embeddings.
+    """
+    Base class for model outputs that include the last hidden states and input embeddings.
 
     Args:
         last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
@@ -1154,6 +1244,7 @@ class BaseModelOutputWithEmbedding(ModelOutput):
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
     """
+
     last_hidden_state: Optional[torch.FloatTensor] = None
     input_embedding: Optional[torch.FloatTensor] = None
     hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
@@ -1162,7 +1253,8 @@ class BaseModelOutputWithEmbedding(ModelOutput):
 
 @dataclass
 class EmbeddedModelingOutput(ModelOutput):
-    """Base class for outputs of embedding prediction.
+    """
+    Base class for outputs of embedding prediction.
 
     Args:
         loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `bool_masked_pos` is provided):
@@ -1176,7 +1268,9 @@ class EmbeddedModelingOutput(ModelOutput):
         `config.output_attentions=True`):
             Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`. Attentions weights after the attention softmax, used to compute the weighted average in
-            the self-attention heads."""
+            the self-attention heads.
+    """
+
     loss: Optional[torch.FloatTensor] = None
     hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[tuple[torch.FloatTensor, ...]] = None
@@ -1199,13 +1293,7 @@ class EmbeddedModelingOutput(ModelOutput):
 
 
 class ViTNepaEmbeddings(nn.Module):
-    """CLS token + patch embeddings.
-
-    Supports 4D (B, C, H, W) and 5D (B, C, D, H, W) inputs.
-    For 5D: each slice is patch-embedded by the same Conv2d, then patches
-    are concatenated along the sequence axis to form (B, D*num_patches, hidden).
-    A single CLS token is prepended per batch sample.
-    """
+    """CLS token + patch embeddings. Handles 4D (one image) and 5D (slice stack)."""
 
     def __init__(self, config: ViTNepaConfig, use_mask_token: bool = False):
         super().__init__()
@@ -1229,17 +1317,13 @@ class ViTNepaEmbeddings(nn.Module):
             )
 
         if pixel_values.dim() == 5:
-            # 5D path: (B, C, D, H, W) -> patch-embed each slice -> (B, D*num_patches, hidden)
             B, C, D, H, W = pixel_values.shape
-            # Reshape so the Conv2d patch projector sees a flat batch of slices
             flat = pixel_values.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
             patch_embeds_flat = self.patch_embeddings(flat, interpolate_pos_encoding=False)
-            # patch_embeds_flat: (B*D, num_patches, hidden)
             num_patches = patch_embeds_flat.shape[1]
             embeddings = patch_embeds_flat.reshape(B, D * num_patches, -1)
             batch_size = B
         else:
-            # 4D path: original behavior (one image per sample)
             batch_size = pixel_values.shape[0]
             embeddings = self.patch_embeddings(pixel_values, interpolate_pos_encoding=False)
 
@@ -1251,7 +1335,6 @@ class ViTNepaEmbeddings(nn.Module):
             mask = bool_masked_pos.unsqueeze(-1).type_as(mask_tokens)
             embeddings = embeddings * (1.0 - mask) + mask_tokens * mask
 
-        # Prepend ONE CLS token (per batch sample, not per slice)
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
         embeddings = torch.cat((cls_tokens, embeddings), dim=1)
         embeddings_clean = torch.cat((cls_tokens, embeddings_clean), dim=1)
@@ -1262,8 +1345,6 @@ class ViTNepaEmbeddings(nn.Module):
 
 
 class ViTNepaPatchEmbeddings(nn.Module):
-    """Conv2d patch projection."""
-
     def __init__(self, config: ViTNepaConfig):
         super().__init__()
         image_size, patch_size = config.image_size, config.patch_size
@@ -1694,11 +1775,8 @@ class ViTNepaModel(ViTNepaPreTrainedModel):
     ) -> BaseModelOutputWithEmbedding:
         r"""
         pixel_values can be 4D (B, C, H, W) for one image, or 5D
-        (B, C, D, H, W) for a slice stack. The model auto-detects.
-
-        For 5D inputs, all D slices are patch-embedded and concatenated
-        along the sequence axis. RoPE is tiled per slice (same 2D pattern).
-        Slice ordering is captured by sequence position + causal attention.
+        (B, C, D, H, W) for a slice stack. The model auto-detects and
+        applies 2D or 3D RoPE accordingly.
         """
 
         if pixel_values is None:
@@ -1716,7 +1794,6 @@ class ViTNepaModel(ViTNepaPreTrainedModel):
             bool_masked_pos=bool_masked_pos,
             interpolate_pos_encoding=interpolate_pos_encoding,
         )
-        # RoPE auto-detects 4D vs 5D from pixel_values shape
         position_embeds = self.rope_embeddings(pixel_values)
 
         encoder_outputs: BaseModelOutput = self.encoder(
